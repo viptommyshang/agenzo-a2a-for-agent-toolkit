@@ -61,9 +61,9 @@ Add the following to your MCP config — workspace `.kiro/settings/mcp.json` (or
       "args": ["agenzo-a2a-for-agent-toolkit"],
       "env": {
         "AGENZO_A2A_BASE_URL": "https://agent-dev.agenzo.com",
-        "AGENZO_A2A_AGENT_ID": "base-orchestrator",
-        "AGENZO_A2A_MEMBER_ID": "prod-user-001",
-        "AGENZO_A2A_API_KEY": "your-api-key-here",
+        "AGENZO_A2A_AGENT_ID": "your_agent_id",
+        "AGENZO_A2A_MEMBER_ID": "your_member_id",
+        "AGENZO_A2A_API_KEY": "your_api_key",
         "AGENZO_A2A_STREAM": "1",
         "AGENZO_A2A_HTTP_TIMEOUT": "180"
       },

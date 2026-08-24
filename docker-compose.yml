@@ -10,15 +10,15 @@ services:
       - AGENZO_MCP_PORT=8080
       # ── Orchestrator Connection ──
       - AGENZO_A2A_BASE_URL=https://agent-dev.agenzo.com
-      - AGENZO_A2A_AGENT_ID=base-orchestrator
-      - AGENZO_A2A_MEMBER_ID=prod-user-001
+      - AGENZO_A2A_AGENT_ID=your_agent_id
+      - AGENZO_A2A_MEMBER_ID=your_member_id
       # ── Auth (pick ONE) ──
       # Option A: Direct API key
-      # - AGENZO_A2A_API_KEY=sk_prod_xxx
+      # - AGENZO_A2A_API_KEY=your_api_key
       # Option B: API key from file (mount the file below)
       # - AGENZO_A2A_API_KEY_FILE=/app/secrets/api_key.local
       # Option C: Self-register with invitation code
-      - AGENZO_A2A_INVITATION_CODE=Pamz3f
+      - AGENZO_A2A_INVITATION_CODE=your_invitation_code
       # ── Optional ──
       - AGENZO_A2A_AGENT_NAME=kiro-agent
       - AGENZO_A2A_STREAM=1
