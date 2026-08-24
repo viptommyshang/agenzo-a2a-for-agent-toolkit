@@ -1,0 +1,29 @@
+services:
+  agenzo-mcp:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # ── MCP Server Transport ──
+      - AGENZO_MCP_TRANSPORT=sse
+      - AGENZO_MCP_HOST=0.0.0.0
+      - AGENZO_MCP_PORT=8080
+      # ── Orchestrator Connection ──
+      - AGENZO_A2A_BASE_URL=https://agent-dev.agenzo.com
+      - AGENZO_A2A_AGENT_ID=base-orchestrator
+      - AGENZO_A2A_MEMBER_ID=prod-user-001
+      # ── Auth (pick ONE) ──
+      # Option A: Direct API key
+      # - AGENZO_A2A_API_KEY=sk_prod_xxx
+      # Option B: API key from file (mount the file below)
+      # - AGENZO_A2A_API_KEY_FILE=/app/secrets/api_key.local
+      # Option C: Self-register with invitation code
+      - AGENZO_A2A_INVITATION_CODE=Pamz3f
+      # ── Optional ──
+      - AGENZO_A2A_AGENT_NAME=kiro-agent
+      - AGENZO_A2A_STREAM=1
+      - AGENZO_A2A_HTTP_TIMEOUT=180
+    # volumes:
+    #   # Mount API key file if using AGENZO_A2A_API_KEY_FILE
+    #   - ./secrets/api_key.local:/app/secrets/api_key.local:ro
+    restart: unless-stopped
