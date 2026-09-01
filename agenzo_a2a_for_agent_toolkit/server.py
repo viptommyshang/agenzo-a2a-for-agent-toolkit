@@ -1,4 +1,4 @@
-"""FastMCP server: lets a Kiro chat drive the Agenzo A2A orchestrator to book hotels/flights.
+"""FastMCP server: lets AI agents drive the Agenzo A2A orchestrator to book hotels/flights.
 
 Design
 ------
@@ -11,6 +11,7 @@ the user what it needs, and calls the next tool. New domains/schemas work with z
 Tools
 -----
 - ``discover()``            – agent card (which domains/skills are bookable).
+- ``configure(...)``        – override orchestrator connection settings at runtime.
 - ``guide()``              – concise cheat-sheet of the card sequences.
 - ``book(request)``        – start a booking conversation from natural language; returns a session.
 - ``send_message(sid,txt)``– natural-language turn (answer a server follow-up).
@@ -40,12 +41,32 @@ _bridge: A2ABridge | None = None
 # session_id → {"context_id", "kind"}. context_id == session_id (one A2A context per session).
 _sessions: dict[str, dict[str, str]] = {}
 
+# Runtime config overrides (set by configure() tool or env vars)
+_runtime_cfg: dict[str, Any] = {}
+
 
 def _get_bridge() -> A2ABridge:
     global _bridge
     if _bridge is None:
+        # Apply runtime overrides to config module
+        if _runtime_cfg:
+            for key, val in _runtime_cfg.items():
+                if hasattr(cfg, key) and val not in (None, ""):
+                    setattr(cfg, key, val)
         _bridge = A2ABridge(cfg)
     return _bridge
+
+
+def _reset_bridge() -> None:
+    """Force re-creation of bridge with updated config."""
+    global _bridge
+    if _bridge is not None:
+        import asyncio
+        try:
+            asyncio.get_event_loop().create_task(_bridge.aclose())
+        except Exception:
+            pass
+    _bridge = None
 
 
 def _new_session(kind: str) -> str:
@@ -122,6 +143,75 @@ async def discover() -> dict[str, Any]:
             if isinstance(s, dict)
         ],
     }
+
+
+@mcp.tool()
+async def configure(
+    base_url: str = "",
+    agent_id: str = "",
+    member_id: str = "",
+    api_key: str = "",
+    invitation_code: str = "",
+    agent_name: str = "",
+    stream: str = "",
+    http_timeout: str = "",
+) -> dict[str, Any]:
+    """Configure the MCP server at runtime. Call this BEFORE booking if you need to override
+    the default orchestrator connection settings. Only non-empty values are applied.
+
+    Parameters:
+      - base_url: orchestrator address (e.g. "https://agent-dev.agenzo.com")
+      - agent_id: agent id (default "base-orchestrator")
+      - member_id: end user placing the order (isolated per developer+member)
+      - api_key: developer API key for authentication
+      - invitation_code: self-register invitation code (used if no api_key)
+      - agent_name: display name for registration (default "kiro-agent")
+      - stream: "1" for streaming, "0" for blocking
+      - http_timeout: timeout in seconds (default "180")
+
+    Returns the active configuration (secrets masked)."""
+    mapping = {
+        "BASE_URL": base_url.rstrip("/") if base_url else "",
+        "AGENT_ID": agent_id,
+        "MEMBER_ID": member_id,
+        "API_KEY": api_key,
+        "INVITATION_CODE": invitation_code,
+        "AGENT_NAME": agent_name,
+    }
+
+    changed = False
+    for key, val in mapping.items():
+        if val:
+            _runtime_cfg[key] = val
+            changed = True
+
+    if stream:
+        _runtime_cfg["STREAM"] = stream.strip().lower() not in ("0", "false", "no")
+        changed = True
+    if http_timeout:
+        _runtime_cfg["HTTP_TIMEOUT"] = float(http_timeout)
+        changed = True
+
+    if changed:
+        _reset_bridge()
+
+    # Return active config (mask secrets)
+    bridge_cfg = {
+        "BASE_URL": getattr(cfg, "BASE_URL", ""),
+        "AGENT_ID": getattr(cfg, "AGENT_ID", ""),
+        "MEMBER_ID": _runtime_cfg.get("MEMBER_ID", getattr(cfg, "MEMBER_ID", "")),
+        "AGENT_NAME": _runtime_cfg.get("AGENT_NAME", getattr(cfg, "AGENT_NAME", "")),
+        "STREAM": _runtime_cfg.get("STREAM", getattr(cfg, "STREAM", True)),
+        "HTTP_TIMEOUT": _runtime_cfg.get("HTTP_TIMEOUT", getattr(cfg, "HTTP_TIMEOUT", 180)),
+        "API_KEY": "***" if (_runtime_cfg.get("API_KEY") or getattr(cfg, "API_KEY", "")) else "(not set)",
+        "INVITATION_CODE": "***" if (_runtime_cfg.get("INVITATION_CODE") or getattr(cfg, "INVITATION_CODE", "")) else "(not set)",
+    }
+    # Apply overrides to show actual values
+    for key in ("BASE_URL", "AGENT_ID", "MEMBER_ID", "AGENT_NAME"):
+        if key in _runtime_cfg:
+            bridge_cfg[key] = _runtime_cfg[key]
+
+    return {"status": "configured" if changed else "unchanged", "config": bridge_cfg}
 
 
 @mcp.tool()
@@ -244,7 +334,15 @@ def open_url(url: str) -> dict[str, Any]:
     UnionPay card-enrollment (enroll_url), and the EVO (Visa/Mastercard) Drop-in card-binding page
     (dropin_url, hosted by the orchestrator). The MCP server runs on the user's machine, so this
     pops the page for the user to complete the passkey/enrollment/card entry. After they finish,
-    drive the next card (e.g. "paid" then "poll", or "bound" then "poll")."""
+    drive the next card (e.g. "paid" then "poll", or "bound" then "poll").
+
+    When deployed remotely (SSE transport), the browser can't be opened on the server, so the URL is
+    returned for the client/user to open instead."""
+    import os
+
+    if os.environ.get("AGENZO_MCP_TRANSPORT", "stdio").strip().lower() == "sse":
+        # Remote mode: cannot open a browser on the server — return the URL for the client to handle.
+        return {"ok": True, "opened": url, "note": "Remote mode: please open this URL in your browser."}
     try:
         opened = webbrowser.open(url)
         return {"ok": bool(opened), "opened": url}
@@ -397,8 +495,26 @@ def guide() -> str:
 
 
 def main() -> None:
-    """Entry point: run the MCP server over stdio (how Kiro launches it)."""
-    mcp.run()
+    """Entry point: run the MCP server.
+
+    Transport is selected by the ``AGENZO_MCP_TRANSPORT`` env var:
+      - ``stdio`` (default): the AI agent launches it locally, communicates via stdin/stdout.
+      - ``sse``: remote deployment, listens on HTTP for SSE connections.
+
+    For SSE mode, configure host/port via:
+      - ``AGENZO_MCP_HOST`` (default ``0.0.0.0``)
+      - ``AGENZO_MCP_PORT`` (default ``8080``)
+    """
+    import os
+
+    transport = os.environ.get("AGENZO_MCP_TRANSPORT", "stdio").strip().lower()
+
+    if transport == "sse":
+        host = os.environ.get("AGENZO_MCP_HOST", "0.0.0.0")
+        port = int(os.environ.get("AGENZO_MCP_PORT", "8080"))
+        mcp.run(transport="sse", host=host, port=port)
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":

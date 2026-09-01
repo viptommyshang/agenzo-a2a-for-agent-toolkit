@@ -1,14 +1,15 @@
 # agenzo-a2a-for-agent-toolkit
 
-An **MCP server** that lets a Kiro chat book hotels and flights by driving the Agenzo
+An **MCP server** that lets AI agents book hotels and flights by driving the Agenzo
 orchestrator's standard **A2A card protocol** — the same protocol the reference scripts
 (`agenzo-agent-orchestrator-base/scripts/prod/prod_hotel_flow.py` / `prod_flight_flow.py`) use,
-minus the interactive CLI. Kiro (the chat agent) becomes the A2A client: it reads each card,
-asks you for anything it needs, and calls the next tool until the order is placed.
+minus the interactive CLI. Any AI agent (Kiro, Claude Desktop, etc.) becomes the A2A client:
+it reads each card, asks the user for anything it needs, and calls the next tool until the
+order is placed.
 
 ## Why MCP
 
-Kiro doesn't book travel natively, but it supports MCP servers. This server exposes a small set of
+AI agents don't book travel natively, but they support MCP servers. This server exposes a small set of
 **stateful tools** over the orchestrator's domain-agnostic card flow. Because the protocol is
 schema-driven, new domains (added as orchestrator schemas) work here with **no code changes**.
 
@@ -16,6 +17,7 @@ schema-driven, new domains (added as orchestrator schemas) work here with **no c
 
 | Tool | Purpose |
 | --- | --- |
+| `configure(...)` | Configure the MCP server at runtime (override connection settings). |
 | `discover()` | Agent card: which domains/skills are bookable + required client capabilities. |
 | `guide()` | Cheat-sheet of the hotel/flight/payment card sequences. |
 | `book(request)` | Start a booking conversation from natural language; returns a `session_id` + cards. |
@@ -24,6 +26,8 @@ schema-driven, new domains (added as orchestrator schemas) work here with **no c
 | `poll(session_id, component)` | Re-check an `*-await` card (`action:"poll"`). |
 | `start_payment(amount_cents, recipient_name, recipient_account)` | Separate payment session: pick/verify a card before confirming. |
 | `open_url(url)` | Open a checkout / card-enrollment page in the local browser. |
+| `resolve_location(address)` | Geocode a place name → `{lat, lng, timezone}` (ride: call before `ride.search`). |
+| `resolve_pickup_time(local_datetime, timezone)` | Local datetime → UTC epoch for a scheduled ride `pickupTime`. |
 
 ## Prerequisites
 
@@ -46,7 +50,7 @@ Set these via the `env` block in `.kiro/settings/mcp.json` (recommended) or a lo
     reference scripts already created), or
   - `AGENZO_A2A_INVITATION_CODE` — self-register when no key is found (key is cached for reuse).
 
-## Register with Kiro
+## Register with your AI agent
 
 Add the following to your MCP config — workspace `.kiro/settings/mcp.json` (or user-level
 `~/.kiro/settings/mcp.json`). Merge into an existing `mcpServers` object if you already have one:
@@ -55,29 +59,31 @@ Add the following to your MCP config — workspace `.kiro/settings/mcp.json` (or
 {
   "mcpServers": {
     "agenzo-travel": {
-      "command": "uv",
-      "args": [
-        "run", "--directory",
-        "e:\\work\\gitlab-projects\\ai-payment\\agenzo-a2a-for-agent-toolkit",
-        "python", "-m", "agenzo_a2a_for_agent_toolkit.server"
-      ],
+      "command": "uvx",
+      "args": ["agenzo-a2a-for-agent-toolkit"],
       "env": {
-        "AGENZO_A2A_BASE_URL": "http://localhost:8000",
-        "AGENZO_A2A_AGENT_ID": "base-orchestrator",
-        "AGENZO_A2A_MEMBER_ID": "prod-user-001",
-        "AGENZO_A2A_API_KEY_FILE": "e:\\work\\gitlab-projects\\ai-payment\\agenzo-agent-orchestrator-base\\scripts\\prod\\api_key.local",
-        "AGENZO_A2A_STREAM": "1"
+        "AGENZO_A2A_BASE_URL": "https://agent-dev.agenzo.com",
+        "AGENZO_A2A_AGENT_ID": "your_agent_id",
+        "AGENZO_A2A_MEMBER_ID": "your_member_id",
+        "AGENZO_A2A_API_KEY": "your_api_key",
+        "AGENZO_A2A_STREAM": "1",
+        "AGENZO_A2A_HTTP_TIMEOUT": "180"
       },
       "disabled": false,
-      "autoApprove": ["discover", "guide", "book", "send_message", "act", "poll", "start_payment"]
+      "autoApprove": ["discover", "guide", "configure", "book", "send_message", "act", "poll", "start_payment", "open_url", "resolve_location", "resolve_pickup_time"]
     }
   }
 }
 ```
 
+> If the package is not published to PyPI, use `--from git+https://...` to pull from your repo:
+> ```json
+> "args": ["--from", "git+https://your-gitlab.com/group/agenzo-a2a-for-agent-toolkit.git", "agenzo-a2a-for-agent-toolkit"]
+> ```
+
 After the orchestrator is up, reconnect the server from Kiro's **MCP Server** view (or restart
-Kiro). Then just ask in chat, e.g. *"Book a one-way flight from Shanghai to Beijing on Aug 24 for
-1 adult"*, and Kiro will drive the flow, asking you for passengers, card selection, etc.
+your agent). Then just ask in chat, e.g. *"Book a one-way flight from Shanghai to Beijing on Aug 24 for
+1 adult"*, and the agent will drive the flow, asking you for passengers, card selection, etc.
 
 ## Run standalone (debug)
 

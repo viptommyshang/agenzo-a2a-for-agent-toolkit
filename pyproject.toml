@@ -1,7 +1,7 @@
 [project]
 name = "agenzo-a2a-for-agent-toolkit"
 version = "0.1.0"
-description = "MCP server that lets a Kiro chat drive the Agenzo A2A orchestrator to book hotels/flights end-to-end."
+description = "MCP server that lets AI agents drive the Agenzo A2A orchestrator to book hotels/flights end-to-end."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -11,10 +11,15 @@ dependencies = [
     "mcp>=1.28,<2",
     "httpx>=0.27",
     "python-dotenv>=1.0",
+    "uvicorn>=0.30",
 ]
 
-# Treat this as a non-packaged application: `uv run` provisions the venv with the
-# dependencies above, but does not try to build/install this project itself.
-# The server is launched with `python -m agenzo_a2a_for_agent_toolkit.server` (cwd on sys.path).
+[project.scripts]
+agenzo-a2a-for-agent-toolkit = "agenzo_a2a_for_agent_toolkit.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [tool.uv]
-package = false
+package = true
