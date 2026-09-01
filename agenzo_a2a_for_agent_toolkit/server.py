@@ -510,9 +510,10 @@ def main() -> None:
     transport = os.environ.get("AGENZO_MCP_TRANSPORT", "stdio").strip().lower()
 
     if transport == "sse":
-        host = os.environ.get("AGENZO_MCP_HOST", "0.0.0.0")
-        port = int(os.environ.get("AGENZO_MCP_PORT", "8080"))
-        mcp.run(transport="sse", host=host, port=port)
+        # FastMCP (mcp 1.x) reads host/port from its settings, not from run() kwargs.
+        mcp.settings.host = os.environ.get("AGENZO_MCP_HOST", "0.0.0.0")
+        mcp.settings.port = int(os.environ.get("AGENZO_MCP_PORT", "8080"))
+        mcp.run(transport="sse")
     else:
         mcp.run()
 
