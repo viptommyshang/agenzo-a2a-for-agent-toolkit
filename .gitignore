@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+uv.lock
 
 # Local env / secrets
 .env

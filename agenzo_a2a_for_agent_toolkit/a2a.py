@@ -249,27 +249,13 @@ class A2ABridge:
                 return self._token
             api_key = (self.cfg.API_KEY or "").strip() or self._read_key_file()
             if not api_key:
-                try:
-                    api_key = await self._register()
-                except AuthError:
-                    # Dev environment may not expose register endpoint;
-                    # try token exchange with invitation_code as api_key fallback,
-                    # or proceed without auth if message endpoint is open.
-                    self._token = "no-auth"
-                    return self._token
-            try:
-                self._token = await self._exchange_token(api_key)
-            except AuthError:
-                # Dev environment may not expose token endpoint either;
-                # proceed without auth.
-                self._token = "no-auth"
+                api_key = await self._register()
+            self._token = await self._exchange_token(api_key)
             return self._token
 
     # ── driving turns (with a single 401 re-auth retry) ───────────────────────
     async def _raw_post(self, body: dict[str, Any], token: str) -> tuple[int, str]:
-        headers: dict[str, str] = {"Content-Type": "application/json"}
-        if token and token != "no-auth":
-            headers["Authorization"] = f"Bearer {token}"
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
         base, agent = self.cfg.BASE_URL, self.cfg.AGENT_ID
         if self.cfg.STREAM:
             url = f"{base}/a2a/agents/{agent}/v1/message:stream"
@@ -290,9 +276,31 @@ class A2ABridge:
     async def _drive(self, body: dict[str, Any]) -> tuple[int, str]:
         token = await self.ensure_token()
         status, text = await self._raw_post(body, token)
-        if status == 401 and token != "no-auth":  # token likely expired → re-exchange once and retry
+        if status == 401:  # token likely expired → re-exchange once and retry
             token = await self.ensure_token(force=True)
             status, text = await self._raw_post(body, token)
+        return status, text
+
+    # ── calling the orchestrator's authed utility endpoints (non-A2A, e.g. /tools/*) ──
+    async def _raw_tool_post(
+        self, path: str, payload: dict[str, Any], token: str
+    ) -> tuple[int, str]:
+        url = f"{self.cfg.BASE_URL}{path}"
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+        resp = await self._client.post(url, json=payload, headers=headers)
+        return resp.status_code, resp.text
+
+    async def call_tool(self, path: str, payload: dict[str, Any]) -> tuple[int, str]:
+        """POST a JSON payload to an authed orchestrator utility endpoint (e.g. ``/tools/resolve-location``).
+
+        Mirrors :meth:`_drive`'s single 401 re-auth retry, but targets a plain HTTP endpoint (not the
+        A2A message transport). Used by the geocoding / pickup-time tools so the chat agent can resolve
+        place names + times to real coordinates/epoch before submitting a ride."""
+        token = await self.ensure_token()
+        status, text = await self._raw_tool_post(path, payload, token)
+        if status == 401:  # token likely expired → re-exchange once and retry
+            token = await self.ensure_token(force=True)
+            status, text = await self._raw_tool_post(path, payload, token)
         return status, text
 
     async def send_text(self, context_id: str, text: str) -> tuple[int, str]:

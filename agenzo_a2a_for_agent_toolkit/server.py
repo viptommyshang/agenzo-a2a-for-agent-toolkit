@@ -18,10 +18,13 @@ Tools
 - ``poll(sid,comp)``       – re-check an ``*-await`` card (``action:"poll"``).
 - ``start_payment(...)``   – separate payment session (pick/verify a card before confirming).
 - ``open_url(url)``        – open a checkout/enrollment page in the local browser.
+- ``resolve_location(addr)``            – geocode a place name → {lat,lng,timezone} (ride: before submit).
+- ``resolve_pickup_time(dt,tz)``        – local datetime → UTC epoch (ride: scheduled pickupTime).
 """
 
 from __future__ import annotations
 
+import json
 import webbrowser
 from typing import Any
 from uuid import uuid4
@@ -37,32 +40,12 @@ _bridge: A2ABridge | None = None
 # session_id → {"context_id", "kind"}. context_id == session_id (one A2A context per session).
 _sessions: dict[str, dict[str, str]] = {}
 
-# Runtime config overrides (set by configure() tool or env vars)
-_runtime_cfg: dict[str, Any] = {}
-
 
 def _get_bridge() -> A2ABridge:
     global _bridge
     if _bridge is None:
-        # Apply runtime overrides to config module
-        if _runtime_cfg:
-            for key, val in _runtime_cfg.items():
-                if hasattr(cfg, key) and val not in (None, ""):
-                    setattr(cfg, key, val)
         _bridge = A2ABridge(cfg)
     return _bridge
-
-
-def _reset_bridge() -> None:
-    """Force re-creation of bridge with updated config."""
-    global _bridge
-    if _bridge is not None:
-        import asyncio
-        try:
-            asyncio.get_event_loop().create_task(_bridge.aclose())
-        except Exception:
-            pass
-    _bridge = None
 
 
 def _new_session(kind: str) -> str:
@@ -101,6 +84,20 @@ def _result(session_id: str, status: int, raw: str) -> dict[str, Any]:
     return out
 
 
+def _tool_result(status: int, raw: str) -> dict[str, Any]:
+    """Parse a plain JSON response from an orchestrator utility endpoint (e.g. ``/tools/*``).
+
+    On non-200 or non-JSON, surface a compact error dict instead of raising — the chat agent then
+    knows geocoding is unavailable and can ask the user for coordinates."""
+    if status != 200:
+        return {"error": f"orchestrator returned HTTP {status}", "detail": _short(raw)}
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"error": "invalid JSON from orchestrator", "detail": _short(raw)}
+    return obj if isinstance(obj, dict) else {"error": "unexpected response", "detail": _short(raw)}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tools
 # ─────────────────────────────────────────────────────────────────────────────
@@ -125,75 +122,6 @@ async def discover() -> dict[str, Any]:
             if isinstance(s, dict)
         ],
     }
-
-
-@mcp.tool()
-async def configure(
-    base_url: str = "",
-    agent_id: str = "",
-    member_id: str = "",
-    api_key: str = "",
-    invitation_code: str = "",
-    agent_name: str = "",
-    stream: str = "",
-    http_timeout: str = "",
-) -> dict[str, Any]:
-    """Configure the MCP server at runtime. Call this BEFORE booking if you need to override
-    the default orchestrator connection settings. Only non-empty values are applied.
-
-    Parameters:
-      - base_url: orchestrator address (e.g. "https://agent-dev.agenzo.com")
-      - agent_id: agent id (default "base-orchestrator")
-      - member_id: end user placing the order (isolated per developer+member)
-      - api_key: developer API key for authentication
-      - invitation_code: self-register invitation code (used if no api_key)
-      - agent_name: display name for registration (default "kiro-agent")
-      - stream: "1" for streaming, "0" for blocking
-      - http_timeout: timeout in seconds (default "180")
-
-    Returns the active configuration (secrets masked)."""
-    mapping = {
-        "BASE_URL": base_url.rstrip("/") if base_url else "",
-        "AGENT_ID": agent_id,
-        "MEMBER_ID": member_id,
-        "API_KEY": api_key,
-        "INVITATION_CODE": invitation_code,
-        "AGENT_NAME": agent_name,
-    }
-
-    changed = False
-    for key, val in mapping.items():
-        if val:
-            _runtime_cfg[key] = val
-            changed = True
-
-    if stream:
-        _runtime_cfg["STREAM"] = stream.strip().lower() not in ("0", "false", "no")
-        changed = True
-    if http_timeout:
-        _runtime_cfg["HTTP_TIMEOUT"] = float(http_timeout)
-        changed = True
-
-    if changed:
-        _reset_bridge()
-
-    # Return active config (mask secrets)
-    bridge_cfg = {
-        "BASE_URL": getattr(cfg, "BASE_URL", ""),
-        "AGENT_ID": getattr(cfg, "AGENT_ID", ""),
-        "MEMBER_ID": _runtime_cfg.get("MEMBER_ID", getattr(cfg, "MEMBER_ID", "")),
-        "AGENT_NAME": _runtime_cfg.get("AGENT_NAME", getattr(cfg, "AGENT_NAME", "")),
-        "STREAM": _runtime_cfg.get("STREAM", getattr(cfg, "STREAM", True)),
-        "HTTP_TIMEOUT": _runtime_cfg.get("HTTP_TIMEOUT", getattr(cfg, "HTTP_TIMEOUT", 180)),
-        "API_KEY": "***" if (_runtime_cfg.get("API_KEY") or getattr(cfg, "API_KEY", "")) else "(not set)",
-        "INVITATION_CODE": "***" if (_runtime_cfg.get("INVITATION_CODE") or getattr(cfg, "INVITATION_CODE", "")) else "(not set)",
-    }
-    # Apply overrides to show actual values
-    for key in ("BASE_URL", "AGENT_ID", "MEMBER_ID", "AGENT_NAME"):
-        if key in _runtime_cfg:
-            bridge_cfg[key] = _runtime_cfg[key]
-
-    return {"status": "configured" if changed else "unchanged", "config": bridge_cfg}
 
 
 @mcp.tool()
@@ -311,21 +239,64 @@ async def start_payment(
 
 @mcp.tool()
 def open_url(url: str) -> dict[str, Any]:
-    """Open a URL in the local default browser — used for UnionPay checkout / card-enrollment pages.
-    The MCP server runs on the user's machine, so this pops the page for the user to complete the
-    passkey/enrollment. After they finish, drive the next card (e.g. "paid" then "poll").
-
-    When deployed remotely (SSE transport), the URL is returned for the client to open."""
-    import os
-
-    if os.environ.get("AGENZO_MCP_TRANSPORT", "stdio").strip().lower() == "sse":
-        # Remote mode: cannot open browser on server, return URL for client to handle
-        return {"ok": True, "opened": url, "note": "Remote mode: please open this URL in your browser."}
+    """Open a URL in the local default browser — used for the out-of-band pages of any card whose
+    action has ``dispatch:"client"`` + ``capability:"open_url"``: UnionPay checkout (passkey),
+    UnionPay card-enrollment (enroll_url), and the EVO (Visa/Mastercard) Drop-in card-binding page
+    (dropin_url, hosted by the orchestrator). The MCP server runs on the user's machine, so this
+    pops the page for the user to complete the passkey/enrollment/card entry. After they finish,
+    drive the next card (e.g. "paid" then "poll", or "bound" then "poll")."""
     try:
         opened = webbrowser.open(url)
         return {"ok": bool(opened), "opened": url}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc), "url": url}
+
+
+@mcp.tool()
+async def resolve_location(address: str) -> dict[str, Any]:
+    """Resolve a place name or address to geographic coordinates + timezone (via the orchestrator's
+    geocoding helper). Call this BEFORE submitting ride.search and resolve BOTH the pickup AND the
+    dropoff (one call each) — the ride backend does NOT geocode, so you must supply real {lat, lng}.
+    NEVER guess coordinates.
+
+    ``address`` — a place name or address, e.g. "Shanghai Pudong Airport" or "The Bund, Shanghai".
+
+    Returns ``{lat, lng, formatted_address, timezone}`` on success (use lat/lng at ride.search submit,
+    and pass the returned ``timezone`` to ``resolve_pickup_time``); or ``{error: ...}`` when geocoding
+    is unconfigured/fails — then ask the user for exact coordinates."""
+    bridge = _get_bridge()
+    try:
+        status, raw = await bridge.call_tool("/tools/resolve-location", {"address": address})
+    except AuthError as exc:
+        return {"error": f"auth failed: {exc}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc), "hint": f"Is the orchestrator running at {cfg.BASE_URL}?"}
+    return _tool_result(status, raw)
+
+
+@mcp.tool()
+async def resolve_pickup_time(local_datetime: str, timezone: str) -> dict[str, Any]:
+    """Convert a local civil date-time to UTC epoch seconds (via the orchestrator's helper). Call this
+    to compute a scheduled ride's ``pickupTime`` — NEVER compute epoch yourself. For an immediate ride
+    use the literal string "now" instead of calling this.
+
+    ``local_datetime`` — an ABSOLUTE local time in ISO 8601 WITHOUT offset, e.g. "2026-09-20T21:00:00";
+    first resolve any relative phrase ("tomorrow 9pm") against today's date. ``timezone`` — the pickup
+    location's IANA zone, e.g. "Asia/Shanghai"; take it from ``resolve_location``'s ``timezone`` field.
+
+    Returns ``{epoch, iso_utc, local_datetime, timezone}`` on success (use ``epoch`` as ride.search
+    ``pickupTime``); or ``{error: ...}`` for an invalid or past time."""
+    bridge = _get_bridge()
+    try:
+        status, raw = await bridge.call_tool(
+            "/tools/resolve-pickup-time",
+            {"local_datetime": local_datetime, "timezone": timezone},
+        )
+    except AuthError as exc:
+        return {"error": f"auth failed: {exc}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc), "hint": f"Is the orchestrator running at {cfg.BASE_URL}?"}
+    return _tool_result(status, raw)
 
 
 _GUIDE = """\
@@ -365,6 +336,43 @@ HOTEL (book):
        price_items,guests:[{guest_name}],contact_name,contact_phone,
        <payment_token_id | payment_method_id>?}) -> hotel.order-detail
 
+RIDE (book):
+  0) RESOLVE FIRST (client-side — the ride backend does NOT geocode; NO hotel dependency):
+       - resolve_location("<pickup place>") AND resolve_location("<dropoff place>") -> each returns
+         {lat,lng,formatted_address,timezone}. Use those lat/lng at submit; NEVER guess coordinates.
+       - scheduled trip: resolve_pickup_time("<local ISO datetime>","<IANA tz from resolve_location>")
+         -> {epoch}; use epoch as pickupTime. Immediate trip: use the literal "now" (skip this call).
+         NEVER compute epoch yourself. If geocoding is unconfigured the helper returns {error} -> ask
+         the user for exact coordinates.
+  1) book("Book a ride from PVG airport to The Bund, Shanghai, tomorrow 9pm, 1 passenger. Name
+       Richard Chen, phone +8613275666789") -> ride.search (prefilled). Fill submit from step 0;
+       pickupTime is the resolve_pickup_time epoch or the literal "now".
+  2) act(sid,"ride.search","submit",{pickupName,pickupLat,pickupLng,dropoffName,dropoffLat,
+       dropoffLng,pickupTime,passengerName,passengerPhone,passengerEmail,passengerCount:1})
+       -> ride.vehicle-select (data.vehicleClasses[], each price{amount,currency,quote_id})
+       NOTE: "No vehicle available" for an immediate ("now") trip is upstream stock, NOT an error
+       -> retry submit with a scheduled pickupTime (a future epoch).
+  3) act(sid,"ride.vehicle-select","select",{vehicle_class,price:{amount,currency,quote_id},
+       passenger_capacity,luggage_capacity}) -> ride.payment-confirm (data.priceAmount/currency)
+  4) PICK PAYMENT (agent-driven — there is NO in-flow card picker; you choose):
+       - UnionPay/Visa: start_payment(priceAmount*100 incl. any surcharges you'll add, passengerName,
+         recipient_account) -> see PAYMENT; finish passkey to ACTIVE -> use that payment_token_id.
+       - A specific bound EVO card (Visa/Mastercard): start_payment(...) just to list cards, take a
+         card id -> use it as payment_method_id (no passkey).
+       - Omit both -> the platform auto-charges the developer's DEFAULT bound card (pay_per_call) or
+         debits the balance (monthly_settlement).
+  5) act(sid,"ride.payment-confirm","confirm",{quote_id,vehicle_class,
+       price:{amount,currency,quote_id},passenger_name,passenger_phone,passenger_email,
+       <payment_token_id | payment_method_id>?}) -> ride.order-tracking (data.status + payment_status)
+       ORDER NUMBERS (show BOTH to the user on ride.order-tracking, clearly labelled):
+         - data.rideOrderId  -> the PLATFORM order number (rio_…) — the user-facing booking id.
+         - data.orderId (== data.rideId, e.g. 4149211) -> the elife UPSTREAM ride id; it is the
+           handle passed as --order-id for status/cancel/update. Present it as the upstream/eLife id,
+           NOT as "the order number". (rideOrderId may be absent on older backends -> then show only orderId.)
+       NOTE: passenger_email is REQUIRED at book; vehicle_class is case-sensitive (pass verbatim).
+       UnionPay MUST go via payment_token_id (an EVO preauth on a UnionPay card is declined). Mint the
+       token for the EXACT total you'll book (base price + seat/meet-and-greet surcharges) so it matches.
+
 PAYMENT (separate session):
   start_payment(amount_cents, recipient_name, recipient_account) -> payment.method-list
     - EVO card (payment_brand=evo): use card id as payment_method_id in the booking confirm.
@@ -372,8 +380,12 @@ PAYMENT (separate session):
         -> payment.action-required{checkout_url, payment_token_id}; open_url(checkout_url);
            after user finishes passkey: act(pay,"payment.action-required","paid",{payment_token_id})
            -> poll(pay,"payment.await") until data.status=="ACTIVE" -> use payment_token_id.
-    - No cards: bind one first: act(pay,"payment.bind","submit",{user_email,brand:"unionpay"|"evo"})
-        then follow payment.bind-required(-evo) (open_url enroll_url) / payment.bind-await(-evo) poll.
+    - No cards: bind one first: act(pay,"payment.bind","submit",{user_email,brand:"unionpay"|"evo"}).
+        Both brands then use open_url (unified): payment.bind-required(-evo) carries a URL in its data
+        (UnionPay: data.enrollUrl/enroll_url; EVO/Visa/Mastercard: data.dropinUrl/dropin_url — a hosted
+        Drop-in card page); call open_url(<that URL>), have the user finish, then
+        act(pay,"payment.bind-required(-evo)","bound",{payment_method_id?}) ->
+        poll(pay,"payment.bind-await(-evo)") until data.status=="ACTIVE".
 """
 
 
@@ -385,26 +397,8 @@ def guide() -> str:
 
 
 def main() -> None:
-    """Entry point: run the MCP server.
-
-    Transport is selected by the ``AGENZO_MCP_TRANSPORT`` env var:
-      - ``stdio`` (default): Kiro launches it locally, communicates via stdin/stdout.
-      - ``sse``: remote deployment, listens on HTTP for SSE connections.
-
-    For SSE mode, configure host/port via:
-      - ``AGENZO_MCP_HOST`` (default ``0.0.0.0``)
-      - ``AGENZO_MCP_PORT`` (default ``8080``)
-    """
-    import os
-
-    transport = os.environ.get("AGENZO_MCP_TRANSPORT", "stdio").strip().lower()
-
-    if transport == "sse":
-        host = os.environ.get("AGENZO_MCP_HOST", "0.0.0.0")
-        port = int(os.environ.get("AGENZO_MCP_PORT", "8080"))
-        mcp.run(transport="sse", host=host, port=port)
-    else:
-        mcp.run()
+    """Entry point: run the MCP server over stdio (how Kiro launches it)."""
+    mcp.run()
 
 
 if __name__ == "__main__":
