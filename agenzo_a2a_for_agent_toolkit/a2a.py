@@ -10,11 +10,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
+from collections import deque
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import httpx
+
+logger = logging.getLogger("agenzo_a2a")
 
 
 class AuthError(RuntimeError):
@@ -79,6 +85,34 @@ def cards_and_texts(task: dict[str, Any]) -> tuple[list[dict[str, Any]], list[st
     return cards, texts
 
 
+def _iter_sse_data(raw: str) -> Iterator[str]:
+    """Yield each SSE block's joined ``data:`` payload (a JSON string) from a raw event stream."""
+    for block in raw.split("\n\n"):
+        data_str = "".join(
+            line[len("data:"):].strip() for line in block.splitlines() if line.startswith("data:")
+        )
+        if data_str:
+            yield data_str
+
+
+def sse_frames(raw: str) -> list[dict[str, Any]]:
+    """Parse a raw SSE stream into the list of JSON-RPC frame objects it carried (best-effort).
+
+    Each frame is one ``event:/data:`` block's parsed ``data`` object (e.g. a
+    ``SendStreamingMessageSuccessResponse`` whose ``result`` is a ``TaskStatusUpdateEvent`` /
+    ``Message`` / ``Task``). Non-JSON blocks are skipped. Used both to find the final Task and to
+    surface the raw frames for protocol inspection."""
+    frames: list[dict[str, Any]] = []
+    for data_str in _iter_sse_data(raw):
+        try:
+            obj = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            frames.append(obj)
+    return frames
+
+
 def final_task(raw: str | None) -> dict[str, Any] | None:
     """Extract the final Task ``result`` from a response (single JSON, or SSE with many frames)."""
     raw = (raw or "").strip()
@@ -94,16 +128,7 @@ def final_task(raw: str | None) -> dict[str, Any] | None:
     # streaming: last `data:` frame whose result kind == "task" (else last result)
     last_task: dict[str, Any] | None = None
     last_result: dict[str, Any] | None = None
-    for block in raw.split("\n\n"):
-        data_str = "".join(
-            line[len("data:"):].strip() for line in block.splitlines() if line.startswith("data:")
-        )
-        if not data_str:
-            continue
-        try:
-            obj = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
+    for obj in sse_frames(raw):
         res = obj.get("result") if isinstance(obj, dict) else None
         if isinstance(res, dict):
             last_result = res
@@ -149,6 +174,72 @@ def normalize_task(task: dict[str, Any] | None) -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Raw protocol inspection: capture the exact A2A request/response for debugging
+# ─────────────────────────────────────────────────────────────────────────────
+def _context_of(body: dict[str, Any]) -> str | None:
+    """Best-effort extract of ``params.message.contextId`` from a JSON-RPC A2A body."""
+    try:
+        return body["params"]["message"].get("contextId")
+    except (KeyError, TypeError, AttributeError):
+        return None
+
+
+def _cap(text: str, maxlen: int) -> str:
+    """Truncate ``text`` to ``maxlen`` chars (0 = no cap), appending a truncation note."""
+    if maxlen and len(text) > maxlen:
+        return text[:maxlen] + f"\n…[truncated {len(text) - maxlen} chars]"
+    return text
+
+
+def _curl_repro(record: dict[str, Any]) -> str:
+    """Build a copy-pasteable ``curl`` that reproduces the captured request.
+
+    The Bearer token is shown as ``$AGENZO_A2A_TOKEN`` (never the real value) so the line is safe
+    to share; set that env var (or paste your own token) to replay it."""
+    parts = [f"curl -X {record.get('method', 'POST')} '{record.get('url', '')}'"]
+    parts.append("  -H 'Content-Type: application/json'")
+    parts.append("  -H 'Authorization: Bearer '\"$AGENZO_A2A_TOKEN\"")
+    if record.get("transport") == "stream":
+        parts.append("  -H 'Accept: text/event-stream'")
+    body = json.dumps(record.get("request") or {}, ensure_ascii=False)
+    parts.append(f"  -d '{body}'")
+    return " \\\n".join(parts)
+
+
+def exchange_view(record: dict[str, Any], *, maxlen: int = 0) -> dict[str, Any]:
+    """Render a captured exchange into a faithful, inspectable dict.
+
+    Surfaces the exact request body plus the response as both raw text (``response_raw``) and,
+    best-effort, structured form (``response_json`` for a blocking JSON-RPC reply, or
+    ``response_frames`` for a streamed SSE reply). Includes a ``curl`` reproduction."""
+    raw = record.get("response") or ""
+    view: dict[str, Any] = {
+        "seq": record.get("seq"),
+        "ts": record.get("ts"),
+        "kind": record.get("kind"),
+        "transport": record.get("transport"),
+        "method": record.get("method"),
+        "url": record.get("url"),
+        "context_id": record.get("context_id"),
+        "status": record.get("status"),
+        "request": record.get("request"),
+        "response_raw": _cap(raw, maxlen),
+    }
+    stripped = raw.strip()
+    if stripped.startswith("{"):
+        try:
+            view["response_json"] = json.loads(stripped)
+        except json.JSONDecodeError:
+            view["response_json"] = None
+    elif stripped:
+        frames = sse_frames(raw)
+        if frames:
+            view["response_frames"] = frames
+    view["curl"] = _curl_repro(record)
+    return view
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Bridge: holds the async client + a cached short-lived token, drives A2A turns
 # ─────────────────────────────────────────────────────────────────────────────
 class A2ABridge:
@@ -158,6 +249,75 @@ class A2ABridge:
         self._token: str | None = None
         self._member_id: str = cfg.MEMBER_ID
         self._lock = asyncio.Lock()
+        # Raw-exchange capture (for inspect() / debug output). Bounded ring buffer; each turn's
+        # exact request body + response text is recorded here so integrators can see the real A2A
+        # protocol that the normalized tool output hides.
+        self.debug: bool = bool(getattr(cfg, "DEBUG", False))
+        self._maxlen: int = int(getattr(cfg, "DEBUG_MAXLEN", 20000))
+        buffer = max(1, int(getattr(cfg, "DEBUG_BUFFER", 50)))
+        self._exchanges: deque[dict[str, Any]] = deque(maxlen=buffer)
+        self._seq: int = 0
+
+    # ── raw-exchange capture / retrieval ──────────────────────────────────────
+    def _record(
+        self,
+        *,
+        kind: str,
+        transport: str,
+        method: str,
+        url: str,
+        request_body: dict[str, Any],
+        status: int,
+        response_text: str,
+    ) -> dict[str, Any]:
+        """Append one exchange to the ring buffer and emit a DEBUG log line. Returns the record."""
+        self._seq += 1
+        record = {
+            "seq": self._seq,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "kind": kind,
+            "transport": transport,
+            "method": method,
+            "url": url,
+            "context_id": _context_of(request_body),
+            "request": request_body,
+            "status": status,
+            # Cap stored response to bound memory; exposure re-caps as needed.
+            "response": _cap(response_text, self._maxlen),
+        }
+        self._exchanges.append(record)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "A2A %s %s -> HTTP %s\n  request:  %s\n  response: %s",
+                transport,
+                url,
+                status,
+                json.dumps(request_body, ensure_ascii=False),
+                record["response"],
+            )
+        return record
+
+    def recent_exchanges(
+        self, limit: int | None = None, context_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return captured exchanges (oldest→newest), optionally filtered by ``context_id`` and
+        capped to the most recent ``limit`` entries."""
+        items = list(self._exchanges)
+        if context_id:
+            items = [e for e in items if e.get("context_id") == context_id]
+        if limit is not None and limit >= 0:
+            items = items[-limit:]
+        return items
+
+    def last_exchange(self, context_id: str | None = None) -> dict[str, Any] | None:
+        """Return the most recent captured exchange (optionally for a given ``context_id``)."""
+        items = self.recent_exchanges(context_id=context_id)
+        return items[-1] if items else None
+
+    @property
+    def buffer_capacity(self) -> int | None:
+        """Max number of raw exchanges retained in the ring buffer."""
+        return self._exchanges.maxlen
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -265,12 +425,24 @@ class A2ABridge:
             ) as resp:
                 if resp.status_code >= 400:
                     err = (await resp.aread()).decode(errors="replace")
+                    self._record(
+                        kind="a2a", transport="stream", method="POST", url=url,
+                        request_body=body, status=resp.status_code, response_text=err,
+                    )
                     return resp.status_code, err
                 async for chunk in resp.aiter_text():
                     buf += chunk
+            self._record(
+                kind="a2a", transport="stream", method="POST", url=url,
+                request_body=body, status=200, response_text=buf,
+            )
             return 200, buf
         url = f"{base}/a2a/agents/{agent}/v1/message:send"
         resp = await self._client.post(url, json=body, headers=headers)
+        self._record(
+            kind="a2a", transport="send", method="POST", url=url,
+            request_body=body, status=resp.status_code, response_text=resp.text,
+        )
         return resp.status_code, resp.text
 
     async def _drive(self, body: dict[str, Any]) -> tuple[int, str]:
@@ -288,6 +460,10 @@ class A2ABridge:
         url = f"{self.cfg.BASE_URL}{path}"
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
         resp = await self._client.post(url, json=payload, headers=headers)
+        self._record(
+            kind="tool", transport="http", method="POST", url=url,
+            request_body=payload, status=resp.status_code, response_text=resp.text,
+        )
         return resp.status_code, resp.text
 
     async def call_tool(self, path: str, payload: dict[str, Any]) -> tuple[int, str]:

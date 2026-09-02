@@ -21,6 +21,15 @@ Tools
 - ``open_url(url)``        – open a checkout/enrollment page in the local browser.
 - ``resolve_location(addr)``            – geocode a place name → {lat,lng,timezone} (ride: before submit).
 - ``resolve_pickup_time(dt,tz)``        – local datetime → UTC epoch (ride: scheduled pickupTime).
+- ``inspect(sid,limit)``   – dump the exact A2A JSON-RPC request/response exchanges (debugging).
+
+Protocol visibility
+-------------------
+The normal tools return a normalized ``{state, text, cards[]}`` view of each A2A Task. Because this
+bridge is primarily a *debugging* tool, the exact A2A protocol is also exposed: set
+``AGENZO_A2A_DEBUG=1`` (or ``configure(debug="1")``) to attach ``raw_request`` / ``raw_response`` to
+every result and log each exchange, and/or call ``inspect()`` any time to dump the captured raw
+JSON-RPC traffic (request body, response frames, and a ``curl`` reproduction).
 """
 
 from __future__ import annotations
@@ -33,7 +42,7 @@ from uuid import uuid4
 from mcp.server.fastmcp import FastMCP
 
 from . import config as cfg
-from .a2a import A2ABridge, AuthError, final_task, normalize_task, _short
+from .a2a import A2ABridge, AuthError, exchange_view, final_task, normalize_task, _short
 
 mcp = FastMCP("agenzo-travel")
 
@@ -53,6 +62,8 @@ def _get_bridge() -> A2ABridge:
             for key, val in _runtime_cfg.items():
                 if hasattr(cfg, key) and val not in (None, ""):
                     setattr(cfg, key, val)
+        # (Re)configure logging with the effective settings before the bridge starts tracing.
+        cfg.setup_logging()
         _bridge = A2ABridge(cfg)
     return _bridge
 
@@ -80,29 +91,56 @@ def _ctx(session_id: str) -> str:
     return s["context_id"] if s else session_id
 
 
+def _attach_debug(out: dict[str, Any], context_id: str | None = None) -> dict[str, Any]:
+    """When debug is on, attach the exact A2A request/response for the last exchange.
+
+    Adds ``raw_request`` (the JSON-RPC body sent), ``raw_response`` (structured when possible, else
+    the raw text) and ``raw_exchange`` (full detail: url, status, curl repro). This is what a direct
+    A2A integrator needs to see, which the normalized output otherwise hides. No-op when debug is
+    off — use the ``inspect`` tool for on-demand access regardless of the flag."""
+    bridge = _get_bridge()
+    if not bridge.debug:
+        return out
+    record = bridge.last_exchange(context_id)
+    if record is None:
+        return out
+    view = exchange_view(record, maxlen=cfg.DEBUG_MAXLEN)
+    out["raw_request"] = view.get("request")
+    out["raw_response"] = view.get("response_json") or view.get("response_frames") or view.get("response_raw")
+    out["raw_exchange"] = view
+    return out
+
+
 def _result(session_id: str, status: int, raw: str) -> dict[str, Any]:
     """Normalize an A2A response into a chat-friendly dict (or an error)."""
+    ctx = _ctx(session_id)
     if status != 200:
-        return {
-            "session_id": session_id,
-            "error": f"orchestrator returned HTTP {status}",
-            "detail": _short(raw),
-            "cards": [],
-            "text": "",
-        }
+        return _attach_debug(
+            {
+                "session_id": session_id,
+                "error": f"orchestrator returned HTTP {status}",
+                "detail": _short(raw),
+                "cards": [],
+                "text": "",
+            },
+            ctx,
+        )
     task = final_task(raw)
     if task is None:
-        return {
-            "session_id": session_id,
-            "error": "no A2A Task in response",
-            "detail": _short(raw),
-            "cards": [],
-            "text": "",
-        }
+        return _attach_debug(
+            {
+                "session_id": session_id,
+                "error": "no A2A Task in response",
+                "detail": _short(raw),
+                "cards": [],
+                "text": "",
+            },
+            ctx,
+        )
     out = normalize_task(task)
     out["session_id"] = session_id
     out["member_id"] = _get_bridge().member_id
-    return out
+    return _attach_debug(out, ctx)
 
 
 def _tool_result(status: int, raw: str) -> dict[str, Any]:
@@ -111,12 +149,13 @@ def _tool_result(status: int, raw: str) -> dict[str, Any]:
     On non-200 or non-JSON, surface a compact error dict instead of raising — the chat agent then
     knows geocoding is unavailable and can ask the user for coordinates."""
     if status != 200:
-        return {"error": f"orchestrator returned HTTP {status}", "detail": _short(raw)}
+        return _attach_debug({"error": f"orchestrator returned HTTP {status}", "detail": _short(raw)})
     try:
         obj = json.loads(raw)
     except json.JSONDecodeError:
-        return {"error": "invalid JSON from orchestrator", "detail": _short(raw)}
-    return obj if isinstance(obj, dict) else {"error": "unexpected response", "detail": _short(raw)}
+        return _attach_debug({"error": "invalid JSON from orchestrator", "detail": _short(raw)})
+    out = obj if isinstance(obj, dict) else {"error": "unexpected response", "detail": _short(raw)}
+    return _attach_debug(out)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,6 +194,8 @@ async def configure(
     agent_name: str = "",
     stream: str = "",
     http_timeout: str = "",
+    debug: str = "",
+    log_file: str = "",
 ) -> dict[str, Any]:
     """Configure the MCP server at runtime. Call this BEFORE booking if you need to override
     the default orchestrator connection settings. Only non-empty values are applied.
@@ -168,6 +209,9 @@ async def configure(
       - agent_name: display name for registration (default "kiro-agent")
       - stream: "1" for streaming, "0" for blocking
       - http_timeout: timeout in seconds (default "180")
+      - debug: "1" to attach the exact A2A ``raw_request``/``raw_response`` to every tool result
+        (and log each exchange), "0" to turn it off. The ``inspect`` tool works regardless.
+      - log_file: optional path to also write request/response traces to (in addition to stderr).
 
     Returns the active configuration (secrets masked)."""
     mapping = {
@@ -191,9 +235,17 @@ async def configure(
     if http_timeout:
         _runtime_cfg["HTTP_TIMEOUT"] = float(http_timeout)
         changed = True
+    if debug:
+        _runtime_cfg["DEBUG"] = debug.strip().lower() not in ("0", "false", "no", "off")
+        changed = True
+    if log_file:
+        _runtime_cfg["LOG_FILE"] = log_file
+        changed = True
 
     if changed:
         _reset_bridge()
+        # Recreate the bridge now so the new settings take effect (and logging is re-applied).
+        _get_bridge()
 
     # Return active config (mask secrets)
     bridge_cfg = {
@@ -203,6 +255,8 @@ async def configure(
         "AGENT_NAME": _runtime_cfg.get("AGENT_NAME", getattr(cfg, "AGENT_NAME", "")),
         "STREAM": _runtime_cfg.get("STREAM", getattr(cfg, "STREAM", True)),
         "HTTP_TIMEOUT": _runtime_cfg.get("HTTP_TIMEOUT", getattr(cfg, "HTTP_TIMEOUT", 180)),
+        "DEBUG": _runtime_cfg.get("DEBUG", getattr(cfg, "DEBUG", False)),
+        "LOG_FILE": _runtime_cfg.get("LOG_FILE", getattr(cfg, "LOG_FILE", "")) or "(stderr only)",
         "API_KEY": "***" if (_runtime_cfg.get("API_KEY") or getattr(cfg, "API_KEY", "")) else "(not set)",
         "INVITATION_CODE": "***" if (_runtime_cfg.get("INVITATION_CODE") or getattr(cfg, "INVITATION_CODE", "")) else "(not set)",
     }
@@ -494,6 +548,32 @@ def guide() -> str:
     return _GUIDE
 
 
+@mcp.tool()
+async def inspect(session_id: str = "", limit: int = 10) -> dict[str, Any]:
+    """Return the exact A2A protocol exchanges this bridge has made (for debugging / integration).
+
+    The normal tools return a normalized ``{state, text, cards[]}`` view; this MCP server is a
+    debugging bridge, so ``inspect`` exposes the REAL JSON-RPC traffic underneath: for each recent
+    exchange it returns the exact ``request`` body sent, the response as raw text
+    (``response_raw``) plus structured form (``response_json`` for blocking, ``response_frames``
+    for a streamed SSE reply), the ``url``/``status``/``transport``/``context_id``, and a ``curl``
+    line that reproduces the call (Bearer token shown as ``$AGENZO_A2A_TOKEN``).
+
+    Works regardless of the ``debug`` flag (the buffer is always captured). Parameters:
+      - session_id: if given, only exchanges for that session's A2A ``contextId`` are returned.
+      - limit: max number of most-recent exchanges to return (default 10)."""
+    bridge = _get_bridge()
+    ctx = _ctx(session_id) if session_id else None
+    records = bridge.recent_exchanges(limit=max(0, int(limit)), context_id=ctx)
+    return {
+        "count": len(records),
+        "debug": bridge.debug,
+        "buffer_capacity": bridge.buffer_capacity,
+        "session_id": session_id or None,
+        "exchanges": [exchange_view(r, maxlen=cfg.DEBUG_MAXLEN) for r in records],
+    }
+
+
 def main() -> None:
     """Entry point: run the MCP server.
 
@@ -506,6 +586,10 @@ def main() -> None:
       - ``AGENZO_MCP_PORT`` (default ``8080``)
     """
     import os
+
+    # Configure logging up front so AGENZO_A2A_DEBUG traces appear from the first call. stderr-only
+    # in stdio mode (stdout is the MCP protocol channel); a file is added when AGENZO_A2A_LOG_FILE set.
+    cfg.setup_logging()
 
     transport = os.environ.get("AGENZO_MCP_TRANSPORT", "stdio").strip().lower()
 
