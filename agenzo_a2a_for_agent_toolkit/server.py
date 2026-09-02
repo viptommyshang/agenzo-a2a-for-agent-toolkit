@@ -12,7 +12,7 @@ Tools
 -----
 - ``discover()``            – agent card (which domains/skills are bookable).
 - ``configure(...)``        – override orchestrator connection settings at runtime.
-- ``guide()``              – concise cheat-sheet of the card sequences.
+- ``guide()``              – domain-agnostic driving law + LIVE domains/scenarios (from the card).
 - ``book(request)``        – start a booking conversation from natural language; returns a session.
 - ``send_message(sid,txt)``– natural-language turn (answer a server follow-up).
 - ``act(sid,comp,action,payload)`` – structured card action (the main driver).
@@ -308,11 +308,16 @@ async def send_message(session_id: str, text: str) -> dict[str, Any]:
 async def act(session_id: str, component: str, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     """Send a STRUCTURED card action to advance the flow (the main driver).
 
-    - ``component``: the current card's ``component`` (e.g. "flight.offer-list", "hotel.search").
-    - ``action``: one of that card's ``actions[].id`` (e.g. "submit", "select", "select-hotel",
-      "select-rate", "confirm", "select-method", "paid", "poll").
-    - ``payload``: the fields that action needs, taken from the previous card's ``data``
-      (e.g. ``{"product_token": "..."}``, ``{"hotel_id": 606361}``).
+    - ``component``: the current card's ``component`` (copy it verbatim from the card; e.g.
+      "flight.offer-list", "hotel.search" — names come from the card, not from this doc).
+    - ``action``: one of that card's ``actions[].id`` / ``item_actions[].id`` (e.g. "submit",
+      "select", "confirm", "poll").
+    - ``payload``: read it from the chosen action, don't guess. If the action declares
+      ``carries: [f1, f2, …]``, send exactly those fields copied from the card's ``data`` (or the
+      chosen list row's data). For a form ``submit``/``confirm``, send the fields present in the
+      card's ``data`` plus anything the user supplied. An action carrying a ``scenario`` navigates
+      to that scenario; an action with ``capability:"open_url"`` needs ``open_url`` on the URL at
+      its ``data_ref`` then its ``callback`` id.
 
     To attach a payment result to a booking confirm, include ``payment_token_id`` (UnionPay) or
     ``payment_method_id`` (EVO/Visa/Mastercard) in the confirm ``payload`` (see ``start_payment``)."""
@@ -340,21 +345,21 @@ async def poll(session_id: str, component: str) -> dict[str, Any]:
 async def start_payment(
     amount_cents: int, recipient_name: str, recipient_account: str = "", member_id: str = ""
 ) -> dict[str, Any]:
-    """Start a SEPARATE payment session (independent context) to pick/verify a card BEFORE
-    confirming an order. Submits pay-setup and returns the ``payment.method-list`` card (the
-    member's ACTIVE cards, each with a ``payment_brand``).
+    """Start a SEPARATE payment session (independent context) to pick/verify a payment method BEFORE
+    confirming an order. Returns the method-picker card listing the member's payment methods (each
+    row carries an ``id`` and a ``payment_brand``).
 
-    Next steps (drive with ``act(payment_session_id, ...)``):
-      - EVO card (Visa/Mastercard): use its ``id`` as ``payment_method_id`` directly in the booking
-        confirm — no further payment steps needed.
-      - UnionPay card: ``act(sid, "payment.method-list", "select-method", {"id": <id>,
-        "payment_brand": "unionpay"})`` → returns ``payment.action-required`` with ``checkout_url``
-        + ``payment_token_id``; call ``open_url(checkout_url)`` and have the user finish the passkey,
-        then ``act(sid, "payment.action-required", "paid", {"payment_token_id": <id>})`` →
-        ``poll(sid, "payment.await")`` until ``data.status == "ACTIVE"``. Use that ``payment_token_id``
-        in the booking confirm.
-      - No card listed: guide the user to bind one first (``act(sid, "payment.bind", "submit",
-        {"user_email": "...", "brand": "unionpay"|"evo"})`` and follow the bind-required/await cards).
+    Then drive it card-first with ``act(payment_session_id, ...)`` — read each card's ``actions`` /
+    ``item_actions`` and follow the generic loop (see ``guide()``); do not assume component names:
+      - Pick a listed method with its row action (it ``carries`` the ``id`` + ``payment_brand``).
+        A method usable without extra steps yields an id you attach to the booking confirm (the
+        confirm action's ``carries`` names the field, e.g. ``payment_method_id``).
+      - If selecting a method returns a card with an ``open_url`` action (passkey / enrollment /
+        Drop-in), call ``open_url`` on the URL at that card's ``data`` field, have the user finish,
+        send the action's ``callback`` id, then ``poll(session_id, component)`` until
+        ``data.status == "ACTIVE"``. Use the resulting credential in the booking confirm.
+      - No method listed / want a new one: use the picker's scenario-jump action (an action carrying
+        a ``scenario``, e.g. "add-method") to enter the add-a-method flow, then follow its cards.
 
     ``amount_cents`` = order total × 100. ``recipient_account`` (phone or email) is REQUIRED for
     UnionPay, may be empty for EVO. ``member_id`` (optional) must match the booking's member."""
@@ -451,101 +456,121 @@ async def resolve_pickup_time(local_datetime: str, timezone: str) -> dict[str, A
     return _tool_result(status, raw)
 
 
-_GUIDE = """\
-Agenzo A2A card driver — cheat sheet
-====================================
-General loop: call a tool -> read the LAST card's {component, data, actions} -> pick an action id
--> call `act(session_id, component, action, payload)` with fields copied from the card's `data`.
-Server "text" (no cards) means the server is asking/telling you something -> reply with
-`send_message(session_id, text)`. Booking + payment MUST use the same member_id.
+# Domain-AGNOSTIC driving law. It never names a specific domain, component, action or field, so it
+# does NOT drift when the orchestrator's schemas change (renamed scenarios/components, new domains).
+# The concrete "what to send next" always comes from each card the orchestrator returns (component +
+# actions[].id + actions[].carries) and from the live scenario catalog appended by guide().
+_GUIDE_GENERIC = """\
+Agenzo A2A card driver — how to drive ANY booking (domain-agnostic)
+===================================================================
+This orchestrator speaks a schema-driven CARD protocol. You do NOT need hardcoded per-domain steps:
+every response tells you what to do next. New domains/scenarios work with no changes to these tools.
 
-FLIGHT (book):
-  1) book("Book a one-way economy flight from Shanghai to Beijing on Aug 24 for 1 adult")
-       -> card flight.search (prefilled). If fields missing, send_message to add them.
-  2) act(sid,"flight.search","submit",{origin,destination,date,tripType:1,cabinClass,
-       adultNum:1,childNum:0,infantNum:0})  -> flight.offer-list
-  3) show offers (data.offers[]); act(sid,"flight.offer-list","select",{product_token})
-       -> flight.booking-confirm (data.totalAmount/currency)
-  4) [optional pay] start_payment(totalAmount*100, passengerName, contactPhone) -> see PAYMENT
-  5) act(sid,"flight.booking-confirm","confirm",{passengers:[{surname,name,type:"adult",
-       gender:"1",id_type:"2",id_number,birthday,expiration,nationality}],contact_name,
-       contact_region:"86",contact_phone,contact_email, <payment_token_id | payment_method_id>?})
-       -> flight.order-detail
-  6) [optional] act(sid,"flight.order-detail","pay",{order_no}) to ticket.
+THE LOOP
+  1) Start: book("<natural-language request>")  -> {session_id, cards[], text, primary_component}.
+     Use discover() (or the LIVE catalog at the bottom of this guide) to see which domains &
+     scenarios exist and example phrasings.
+  2) Read the LAST card: {component, kind, data, actions[], item_actions[]}.
+  3) Pick one of actions[].id and advance:  act(session_id, component, action_id, payload)
+  4) Repeat until an order / tracking / detail card appears. Surface to the user the ids and fields
+     the card actually exposes (don't invent field names).
 
-HOTEL (book):
-  1) book("Book a hotel near the Bund in Shanghai, 1 adult, check-in Aug 18, check-out Aug 19")
-       -> hotel.search
-  2) act(sid,"hotel.search","submit",{location,checkIn,checkOut,adults,children:0,roomNum:1,
-       guestName,contactName,contactPhone}) -> hotel.location-select (destination candidates)
-  3) act(sid,"hotel.location-select","select-destination",{destination_id,lat,lng})
-       -> hotel.search-list
-  4) act(sid,"hotel.search-list","select-hotel",{hotel_id}) -> hotel.detail (rooms[])
-  5) act(sid,"hotel.detail","select-rate",{product_token,room_name,total_price:{amount,currency},
-       price_items}) -> hotel.booking-confirm
-  6) [optional pay] start_payment(...) -> see PAYMENT
-  7) act(sid,"hotel.booking-confirm","confirm",{product_token,total_price:{amount,currency},
-       price_items,guests:[{guest_name}],contact_name,contact_phone,
-       <payment_token_id | payment_method_id>?}) -> hotel.order-detail
+BUILDING THE PAYLOAD — read it from the card, do not guess
+  • An action may declare `carries: [f1, f2, …]`  ->  payload = EXACTLY those fields, copied from the
+    card's `data`. For a list-row action (in `item_actions`), copy them from the chosen row's data.
+  • A form card (kind="form") `submit`/`confirm`  ->  payload = the fields present in the card's
+    `data` (already-prefilled values) plus anything the user supplied. If a required value is
+    missing, ASK the user (or send_message(session_id, "...")) — never fabricate it.
+  • An action with `scenario: "<name>"` is a SCENARIO JUMP (e.g. adding a payment method): sending it
+    returns that scenario's entry card; then keep following the same loop.
+  • An action with `dispatch:"client"` + `capability:"open_url"` needs an out-of-band browser page:
+    open the URL at the card's `data[<data_ref>]` via open_url(...), have the user finish, then send
+    the action's `callback` id (carrying whatever it lists). Poll any `*-await` card with
+    poll(session_id, component) until `data.status == "ACTIVE"` (or another terminal state).
 
-RIDE (book):
-  0) RESOLVE FIRST (client-side — the ride backend does NOT geocode; NO hotel dependency):
-       - resolve_location("<pickup place>") AND resolve_location("<dropoff place>") -> each returns
-         {lat,lng,formatted_address,timezone}. Use those lat/lng at submit; NEVER guess coordinates.
-       - scheduled trip: resolve_pickup_time("<local ISO datetime>","<IANA tz from resolve_location>")
-         -> {epoch}; use epoch as pickupTime. Immediate trip: use the literal "now" (skip this call).
-         NEVER compute epoch yourself. If geocoding is unconfigured the helper returns {error} -> ask
-         the user for exact coordinates.
-  1) book("Book a ride from PVG airport to The Bund, Shanghai, tomorrow 9pm, 1 passenger. Name
-       Richard Chen, phone +8613275666789") -> ride.search (prefilled). Fill submit from step 0;
-       pickupTime is the resolve_pickup_time epoch or the literal "now".
-  2) act(sid,"ride.search","submit",{pickupName,pickupLat,pickupLng,dropoffName,dropoffLat,
-       dropoffLng,pickupTime,passengerName,passengerPhone,passengerEmail,passengerCount:1})
-       -> ride.vehicle-select (data.vehicleClasses[], each price{amount,currency,quote_id})
-       NOTE: "No vehicle available" for an immediate ("now") trip is upstream stock, NOT an error
-       -> retry submit with a scheduled pickupTime (a future epoch).
-  3) act(sid,"ride.vehicle-select","select",{vehicle_class,price:{amount,currency,quote_id},
-       passenger_capacity,luggage_capacity}) -> ride.payment-confirm (data.priceAmount/currency)
-  4) PICK PAYMENT (agent-driven — there is NO in-flow card picker; you choose):
-       - UnionPay/Visa: start_payment(priceAmount*100 incl. any surcharges you'll add, passengerName,
-         recipient_account) -> see PAYMENT; finish passkey to ACTIVE -> use that payment_token_id.
-       - A specific bound EVO card (Visa/Mastercard): start_payment(...) just to list cards, take a
-         card id -> use it as payment_method_id (no passkey).
-       - Omit both -> the platform auto-charges the developer's DEFAULT bound card (pay_per_call) or
-         debits the balance (monthly_settlement).
-  5) act(sid,"ride.payment-confirm","confirm",{quote_id,vehicle_class,
-       price:{amount,currency,quote_id},passenger_name,passenger_phone,passenger_email,
-       <payment_token_id | payment_method_id>?}) -> ride.order-tracking (data.status + payment_status)
-       ORDER NUMBERS (show BOTH to the user on ride.order-tracking, clearly labelled):
-         - data.rideOrderId  -> the PLATFORM order number (rio_…) — the user-facing booking id.
-         - data.orderId (== data.rideId, e.g. 4149211) -> the elife UPSTREAM ride id; it is the
-           handle passed as --order-id for status/cancel/update. Present it as the upstream/eLife id,
-           NOT as "the order number". (rideOrderId may be absent on older backends -> then show only orderId.)
-       NOTE: passenger_email is REQUIRED at book; vehicle_class is case-sensitive (pass verbatim).
-       UnionPay MUST go via payment_token_id (an EVO preauth on a UnionPay card is declined). Mint the
-       token for the EXACT total you'll book (base price + seat/meet-and-greet surcharges) so it matches.
+ANSWERING THE SERVER
+  • A response with `text` and no cards means the server is asking/telling you something  ->  reply
+    with send_message(session_id, text).
 
-PAYMENT (separate session):
-  start_payment(amount_cents, recipient_name, recipient_account) -> payment.method-list
-    - EVO card (payment_brand=evo): use card id as payment_method_id in the booking confirm.
-    - UnionPay card: act(pay,"payment.method-list","select-method",{id,payment_brand:"unionpay"})
-        -> payment.action-required{checkout_url, payment_token_id}; open_url(checkout_url);
-           after user finishes passkey: act(pay,"payment.action-required","paid",{payment_token_id})
-           -> poll(pay,"payment.await") until data.status=="ACTIVE" -> use payment_token_id.
-    - No cards: bind one first: act(pay,"payment.bind","submit",{user_email,brand:"unionpay"|"evo"}).
-        Both brands then use open_url (unified): payment.bind-required(-evo) carries a URL in its data
-        (UnionPay: data.enrollUrl/enroll_url; EVO/Visa/Mastercard: data.dropinUrl/dropin_url — a hosted
-        Drop-in card page); call open_url(<that URL>), have the user finish, then
-        act(pay,"payment.bind-required(-evo)","bound",{payment_method_id?}) ->
-        poll(pay,"payment.bind-await(-evo)") until data.status=="ACTIVE".
+PAYMENT — runs in its OWN session
+  • Booking + payment MUST share the same member_id.
+  • start_payment(amount_cents, recipient_name, recipient_account) opens a SEPARATE payment session
+    and returns a card to pick/verify a payment method. Drive it with act(payment_session_id, ...)
+    exactly like the loop above — including any `scenario`-jump action to add a new method, and
+    open_url for a passkey / enrollment / Drop-in page, then poll the await card to "ACTIVE".
+  • When you have a usable credential, attach it to the booking `confirm` payload. The confirm card's
+    action `carries` names the field (e.g. payment_token_id or payment_method_id). Omit payment to
+    let the platform charge the developer's default.
+
+RIDES — resolve on the client BEFORE submitting a ride search
+  • The ride backend does NOT geocode. Resolve BOTH pickup and dropoff with resolve_location(addr)
+    -> {lat,lng,timezone}; for a scheduled trip compute pickupTime with
+    resolve_pickup_time(local_iso, timezone) -> {epoch} (use the literal "now" for immediate).
+    Never guess coordinates or epochs. Put the returned values into the ride search submit payload
+    (the exact field names come from that card's `data` / action `carries`).
+
+DEBUGGING
+  • inspect(session_id?, limit?) dumps the exact A2A JSON-RPC request/response (the raw protocol).
 """
 
 
+def _render_scenario_catalog(card: dict[str, Any]) -> str:
+    """Render the agent card's skills into a live 'domains -> scenarios (+ example phrasings)' list.
+
+    Fully data-driven: each in-scope scenario the orchestrator advertises is one skill (tags =
+    [category, scenario, noun], examples = intent keywords). So new/renamed scenarios show up here
+    automatically — nothing to maintain in this file."""
+    skills = card.get("skills") or []
+    if not isinstance(skills, list) or not skills:
+        return "(The orchestrator advertised no skills.)"
+    by_domain: dict[str, list[dict[str, Any]]] = {}
+    for s in skills:
+        if not isinstance(s, dict):
+            continue
+        tags = s.get("tags") or []
+        domain = (tags[0] if tags else None) or "other"
+        by_domain.setdefault(str(domain), []).append(s)
+    lines: list[str] = []
+    for domain, items in by_domain.items():
+        lines.append(f"- {domain}:")
+        for s in items:
+            tags = s.get("tags") or []
+            scenario = tags[1] if len(tags) > 1 else (s.get("name") or s.get("id") or "?")
+            examples = [str(e) for e in (s.get("examples") or []) if str(e).strip()][:4]
+            line = f"    • {scenario} (skill: {s.get('id')})"
+            if examples:
+                line += " — e.g. " + "; ".join(f'"{e}"' for e in examples)
+            lines.append(line)
+    return "\n".join(lines)
+
+
 @mcp.tool()
-def guide() -> str:
-    """Return a concise cheat-sheet of the hotel/flight/payment card sequences. Read this once when
-    you start driving a booking to know which action ids and payload fields each card expects."""
-    return _GUIDE
+async def guide() -> str:
+    """Return the domain-agnostic driving law PLUS a LIVE catalog of bookable domains/scenarios.
+
+    The step-by-step logic no longer hardcodes per-domain component/action/field names (those come
+    from each card the orchestrator returns — read `actions[].id` and `actions[].carries`). The
+    catalog is generated from the orchestrator's schema-driven agent card, so it tracks new/renamed
+    domains and scenarios automatically. Read this once when you start driving a booking."""
+    parts = [_GUIDE_GENERIC]
+    bridge = _get_bridge()
+    try:
+        card = await bridge.agent_card()
+    except Exception as exc:  # noqa: BLE001 — guide must work even if the orchestrator is down
+        parts.append(
+            "Bookable domains & scenarios: could not reach the orchestrator's agent card "
+            f"({exc}). Call discover() once it is up to list them."
+        )
+        return "\n".join(parts)
+
+    parts.append("Bookable domains & scenarios (LIVE from the orchestrator's agent card)")
+    parts.append("=" * 70)
+    desc = card.get("description")
+    if isinstance(desc, str) and desc.strip():
+        parts.append(desc.strip())
+        parts.append("")
+    parts.append(_render_scenario_catalog(card))
+    return "\n".join(parts)
 
 
 @mcp.tool()
