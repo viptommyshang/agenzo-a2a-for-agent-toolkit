@@ -19,7 +19,7 @@ schema-driven, new domains (added as orchestrator schemas) work here with **no c
 | --- | --- |
 | `configure(...)` | Configure the MCP server at runtime (override connection settings). |
 | `discover()` | Agent card: which domains/skills are bookable + required client capabilities. |
-| `guide()` | Cheat-sheet of the hotel/flight/payment card sequences. |
+| `guide()` | Domain-agnostic driving law + a LIVE catalog of bookable domains/scenarios (from the agent card). |
 | `book(request)` | Start a booking conversation from natural language; returns a `session_id` + cards. |
 | `send_message(session_id, text)` | Natural-language turn (answer a server follow-up). |
 | `act(session_id, component, action, payload)` | Structured card action (the main driver). |

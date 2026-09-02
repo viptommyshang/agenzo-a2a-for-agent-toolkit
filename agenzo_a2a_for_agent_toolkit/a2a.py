@@ -142,8 +142,33 @@ def task_state(task: dict[str, Any]) -> str:
     return str(st.get("state") or "") if isinstance(st, dict) else ""
 
 
+# Action metadata the orchestrator already sends on each card. Preserving it lets the chat agent
+# drive **generically** (no hardcoded per-domain cheat-sheet): the payload for an action is exactly
+# the fields named in ``carries``; ``scenario`` means the action navigates to another scenario;
+# ``capability``/``data_ref``/``callback`` describe out-of-band steps (e.g. open_url → callback).
+_ACTION_KEYS = ("id", "dispatch", "carries", "scenario", "capability", "data_ref", "callback", "refresh")
+
+
+def _norm_action(a: Any) -> dict[str, Any] | None:
+    """Keep the action's meaningful fields (drop absent ones so the envelope stays compact)."""
+    if not isinstance(a, dict):
+        return None
+    out = {k: a[k] for k in _ACTION_KEYS if a.get(k) is not None}
+    return out or None
+
+
+def _norm_actions(actions: Any) -> list[dict[str, Any]]:
+    return [na for a in (actions or []) if (na := _norm_action(a)) is not None]
+
+
 def normalize_task(task: dict[str, Any] | None) -> dict[str, Any]:
-    """Turn a Task into a compact, chat-friendly shape: ``{state, text, cards[], primary_component}``."""
+    """Turn a Task into a compact, chat-friendly shape: ``{state, text, cards[], primary_component}``.
+
+    Card ``actions`` (and list ``item_actions``) keep the full driving contract the orchestrator
+    sends — notably ``carries`` (the exact payload fields for that action) and ``scenario`` (a
+    scenario-navigation action). This is what lets the agent advance **without** a hardcoded,
+    per-domain cheat-sheet: it reads the last card's ``component`` + ``actions[].id`` and copies the
+    ``carries`` fields (or the form's ``data`` fields) into the ``act`` payload."""
     if not isinstance(task, dict):
         return {"state": "", "text": "", "cards": [], "primary_component": None}
     cards_raw, texts = cards_and_texts(task)
@@ -151,18 +176,13 @@ def normalize_task(task: dict[str, Any] | None) -> dict[str, Any]:
     for env in cards_raw:
         if not isinstance(env, dict):
             continue
-        actions = [
-            {"id": a.get("id"), "dispatch": a.get("dispatch")}
-            for a in (env.get("actions") or [])
-            if isinstance(a, dict)
-        ]
         cards.append(
             {
                 "component": env.get("component"),
                 "kind": env.get("kind"),
                 "data": env.get("data"),
-                "actions": actions,
-                "item_actions": env.get("item_actions"),
+                "actions": _norm_actions(env.get("actions")),
+                "item_actions": _norm_actions(env.get("item_actions")),
             }
         )
     return {
