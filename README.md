@@ -28,6 +28,7 @@ schema-driven, new domains (added as orchestrator schemas) work here with **no c
 | `open_url(url)` | Open a checkout / card-enrollment page in the local browser. |
 | `resolve_location(address)` | Geocode a place name → `{lat, lng, timezone}` (ride: call before `ride.search`). |
 | `resolve_pickup_time(local_datetime, timezone)` | Local datetime → UTC epoch for a scheduled ride `pickupTime`. |
+| `inspect(session_id, limit)` | Dump the exact A2A JSON-RPC request/response exchanges (debugging / integration). |
 
 ## Prerequisites
 
@@ -49,6 +50,13 @@ Set these via the `env` block in `.kiro/settings/mcp.json` (recommended) or a lo
     point it at `…/agenzo-agent-orchestrator-base/scripts/prod/api_key.local` to reuse the key the
     reference scripts already created), or
   - `AGENZO_A2A_INVITATION_CODE` — self-register when no key is found (key is cached for reuse).
+- Debugging / raw protocol visibility (all optional):
+  - `AGENZO_A2A_DEBUG` — `1` to attach the exact `raw_request` / `raw_response` to every tool result
+    and log each exchange; `0` (default) keeps output normalized.
+  - `AGENZO_A2A_LOG_FILE` — path to also write request/response traces to (in addition to stderr).
+  - `AGENZO_A2A_DEBUG_BUFFER` — how many recent exchanges `inspect()` keeps in memory (default `50`).
+  - `AGENZO_A2A_DEBUG_MAXLEN` — char cap applied to surfaced request/response bodies (default
+    `20000`; `0` disables the cap).
 
 ## Register with your AI agent
 
@@ -70,7 +78,7 @@ Add the following to your MCP config — workspace `.kiro/settings/mcp.json` (or
         "AGENZO_A2A_HTTP_TIMEOUT": "180"
       },
       "disabled": false,
-      "autoApprove": ["discover", "guide", "configure", "book", "send_message", "act", "poll", "start_payment", "open_url", "resolve_location", "resolve_pickup_time"]
+      "autoApprove": ["discover", "guide", "configure", "book", "send_message", "act", "poll", "start_payment", "open_url", "resolve_location", "resolve_pickup_time", "inspect"]
     }
   }
 }
@@ -90,6 +98,45 @@ your agent). Then just ask in chat, e.g. *"Book a one-way flight from Shanghai t
 ```bash
 uv run python -m agenzo_a2a_for_agent_toolkit.server   # serves MCP over stdio
 ```
+
+## Seeing the raw A2A protocol
+
+The tools return a **normalized** view (`{state, text, cards[], primary_component}`) that is easy
+for the chat agent to drive — it is *not* the raw A2A message. Likewise, what your MCP client (e.g.
+Kiro) shows as the tool input (`{request, _meta: …}`) is the **MCP call**, not the A2A request: the
+`request` string becomes a single `TextPart`, and the real JSON-RPC envelope (`contextId`,
+`messageId`, `parts`, …) is built inside the bridge. Integrators who talk to A2A directly need the
+real request/response — expose it two ways:
+
+1. **`inspect(session_id?, limit?)`** — dumps the captured exchanges regardless of any flag. Each
+   entry has the exact `request` body, the `response_raw` text plus structured `response_json`
+   (blocking) or `response_frames` (streamed SSE), the `url` / `status` / `transport` / `context_id`,
+   and a `curl` line that reproduces the call (token shown as `$AGENZO_A2A_TOKEN`).
+2. **Debug mode** — set `AGENZO_A2A_DEBUG=1` (env) or call `configure(debug="1")`; every tool result
+   then also carries `raw_request` / `raw_response` / `raw_exchange`, and each exchange is logged
+   (stderr, plus `AGENZO_A2A_LOG_FILE` if set). In stdio transport, logs go to **stderr only** —
+   stdout is the MCP protocol channel.
+
+A captured `book(...)` turn looks like this on the wire:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "…",
+  "method": "message/stream",
+  "params": {
+    "message": {
+      "messageId": "…",
+      "role": "user",
+      "parts": [{ "kind": "text", "text": "Book a ride from …" }],
+      "contextId": "…"
+    }
+  }
+}
+```
+
+POSTed to `/a2a/agents/<agent_id>/v1/message:stream` (or `:send` when `AGENZO_A2A_STREAM=0`). One
+A2A `contextId` is reused for the whole session (`start_payment` opens a separate one).
 
 ## Payment notes
 
