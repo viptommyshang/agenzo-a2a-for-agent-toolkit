@@ -137,6 +137,38 @@ def _tool_result(status: int, raw: str) -> dict[str, Any]:
     return obj if isinstance(obj, dict) else {"error": "unexpected response", "detail": _short(raw)}
 
 
+# Actions that SETTLE money (place/charge an order). Kept small on purpose to avoid false positives.
+_SETTLE_ACTIONS = {"confirm", "book"}
+# Fields that carry an explicit, user-chosen payment credential on a settle action.
+_PAYMENT_FIELDS = ("payment_method_id", "payment_token_id")
+
+
+def _settle_without_payment(component: str, action: str, payload: dict[str, Any]) -> bool:
+    """Detect an order action that SETTLES money but carries no explicit, user-chosen payment
+    credential. Used to attach a NON-BLOCKING advisory to the result — the action is still
+    forwarded to the orchestrator (any HARD stop belongs in the orchestrator/merchant backend, not
+    in this thin bridge). Deliberately narrow (settle actions on booking/payment cards only) so it
+    does not fire on unrelated confirms such as cancellations."""
+    if (action or "").strip().lower() not in _SETTLE_ACTIONS:
+        return False
+    comp = (component or "").lower()
+    # Skip actions that do NOT charge the card (cancellations, refunds, void, check-out).
+    if any(k in comp for k in ("cancel", "refund", "void", "checkout", "check-out")):
+        return False
+    if not any(k in comp for k in ("confirm", "booking", "payment", "order")):
+        return False
+    return not any(str((payload or {}).get(f) or "").strip() for f in _PAYMENT_FIELDS)
+
+
+_PAYMENT_WARNING = (
+    "POLICY WARNING: this order confirmation carried NO user-chosen payment method "
+    "(payload had neither payment_method_id nor payment_token_id). You must resolve payment via "
+    "start_payment() and let the USER pick a card BEFORE confirming — omitting it can cause a "
+    "silent charge to a platform/member default card. If this order settles money, verify or cancel "
+    "it, then redo the confirm carrying the payment credential the user explicitly selected."
+)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tools
 # ─────────────────────────────────────────────────────────────────────────────
@@ -307,14 +339,28 @@ async def act(session_id: str, component: str, action: str, payload: dict[str, A
       to that scenario; an action with ``capability:"open_url"`` needs ``open_url`` on the URL at
       its ``data_ref`` then its ``callback`` id.
 
+    USER CHOOSES — never auto-select. When the current card offers a CHOICE (a list with multiple
+    rows, or several options: hotels, room types, room rates, flight offers, vehicle classes, payment
+    methods), present the options to the user and send the chosen action ONLY after the user picks.
+    Do not pick by price/distance/rating/position, and do not auto-pick even a single option — confirm
+    it with the user first.
+
     To attach a payment result to a booking confirm, include ``payment_token_id`` (UnionPay) or
-    ``payment_method_id`` (EVO/Visa/Mastercard) in the confirm ``payload`` (see ``start_payment``)."""
+    ``payment_method_id`` (EVO/Visa/Mastercard) in the confirm ``payload`` (see ``start_payment``).
+    An order ``confirm``/``book`` that settles money MUST carry the payment method the USER explicitly
+    chose — never omit it to fall back to a platform/member default charge."""
     bridge = _get_bridge()
+    payload = payload or {}
     try:
-        status, raw = await bridge.send_action(_ctx(session_id), component, action, payload or {})
+        status, raw = await bridge.send_action(_ctx(session_id), component, action, payload)
     except AuthError as exc:
         return {"session_id": session_id, "error": f"auth failed: {exc}", "cards": [], "text": ""}
-    return _result(session_id, status, raw)
+    out = _result(session_id, status, raw)
+    # Non-blocking soft guardrail: flag a money-settling confirm that omitted an explicit,
+    # user-chosen payment method (see _settle_without_payment). The action is still forwarded.
+    if "error" not in out and _settle_without_payment(component, action, payload):
+        out["payment_warning"] = _PAYMENT_WARNING
+    return out
 
 
 @mcp.tool()
@@ -337,6 +383,13 @@ async def start_payment(
     confirming an order. This is BRAND-AGNOSTIC — it returns the method-picker card listing ALL the
     member's payment methods (UnionPay AND EVO Visa/Mastercard); each row carries an ``id`` and a
     ``payment_brand``. It does NOT force UnionPay.
+
+    MANDATORY & USER-DRIVEN. Call this BEFORE every order ``confirm``/``book`` that settles money —
+    never confirm without a user-chosen payment method, and never rely on a platform/member "default"
+    card. Present the returned methods to the user (brand + last4) and let the USER choose which one
+    to use; do NOT auto-select, not even when exactly one card is listed (confirm that one with the
+    user first). If the picker is EMPTY, ask the user to add a card and ask which brand they want
+    (UnionPay or Visa/Mastercard) — do not pick the brand for them.
 
     Then drive it card-first with ``act(payment_session_id, ...)`` — read each card's ``actions`` /
     ``item_actions`` and follow the generic loop (see ``guide()``); do not assume component names:
@@ -479,6 +532,18 @@ Agenzo A2A card driver — how to drive ANY booking (domain-agnostic)
 This orchestrator speaks a schema-driven CARD protocol. You do NOT need hardcoded per-domain steps:
 every response tells you what to do next. New domains/scenarios work with no changes to these tools.
 
+CORE PRINCIPLE — THE USER CHOOSES, NOT YOU (applies to EVERY domain & step)
+  Whenever a card presents a CHOICE — a list with multiple rows, or several actions/options that
+  represent alternatives (hotels, room types, room rates, flight offers, vehicle classes, AND
+  payment methods) — you MUST surface those options to the user and advance ONLY on the user's
+  explicit pick. NEVER auto-select on the user's behalf — not by price, distance, rating, "lowest",
+  "closest", list position, or because there is only ONE option. When a single option exists, still
+  confirm it with the user before acting. Any step that settles money (an order `confirm`/`book`)
+  requires the user's explicit go-ahead on BOTH what is being bought AND which payment method pays
+  for it. The only things you may fill without asking are values the user ALREADY stated (name,
+  phone, email, dates, counts, etc.). If you are unsure whether a decision is yours to make, it is
+  not — ask the user.
+
 THE LOOP
   1) Start: book("<natural-language request>")  -> {session_id, cards[], text, primary_component}.
      Use discover() (or the LIVE catalog at the bottom of this guide) to see which domains &
@@ -510,21 +575,29 @@ ANSWERING THE SERVER
 
 PAYMENT — runs in its OWN session (BRAND-AGNOSTIC: UnionPay OR EVO Visa/Mastercard)
   • Booking + payment MUST share the same member_id.
+  • MANDATORY — RESOLVE PAYMENT BEFORE EVERY ORDER. Before you send ANY order `confirm`/`book` that
+    settles money, you MUST first run start_payment(...) and let the USER choose how to pay. NEVER
+    confirm an order without an explicit, user-chosen payment credential — do NOT rely on, or fall
+    back to, any "platform / developer / member default" card. If you skip this, the backend may
+    silently charge whatever default it finds, which is exactly what must NOT happen.
   • start_payment(amount_cents, recipient_name, recipient_account) opens a SEPARATE payment session
     and returns a picker listing ALL the member's cards (any brand). Drive it with
-    act(payment_session_id, ...) like the loop above. Routing follows the card you PICK: an EVO card
-    is returned directly as payment_method_id; a UnionPay card mints a token via a passkey (open_url
-    → poll to ACTIVE) → payment_token_id.
-  • If the picker is EMPTY (no cards) or the user wants a new one, send the `add-method` action, then
-    submit the add-method form. It REQUIRES `user_email`, and `brand` CHOOSES the card type:
-    `brand:"evo"` → Visa/Mastercard (EVO Drop-in); omitted/other → UnionPay. Don't default to
-    UnionPay silently — if the user hasn't said which, ASK whether they want UnionPay or a
-    Visa/Mastercard, then pass the matching `brand`.
+    act(payment_session_id, ...) like the loop above.
+      – IF ONE OR MORE CARDS ARE LISTED: present them to the user (brand + last4) and let the USER
+        pick which card to use. Do NOT auto-select — not even when there is exactly ONE card; confirm
+        that one with the user first. Only after the user picks do you `select-method` that row.
+      – IF THE PICKER IS EMPTY (no cards): you MUST ask the user to add one before going further —
+        there is no valid "just charge the default" path. Ask whether they want a UnionPay card or a
+        Visa/Mastercard, then send `add-method` and submit its form (REQUIRES `user_email`; `brand`
+        CHOOSES the type: `brand:"evo"` → Visa/Mastercard EVO Drop-in; omitted/other → UnionPay).
+        Never pick the brand for the user.
+  • Routing follows the card the USER picked: an EVO card is returned directly as payment_method_id;
+    a UnionPay card mints a token via a passkey (open_url → poll to ACTIVE) → payment_token_id.
   • AFTER binding a UnionPay card, MINT THE TOKEN BY PICKING THE CARD — do NOT shortcut. Reuse the
     SAME payment session: submit `payment.setup` with ONLY {amount_cents, recipient_name,
     recipient_account} (do NOT put payment_method_id in it), read the `payment.method-list`, then
-    `select-method` the just-bound card. That row `carries` `payment_brand="unionpay"`, which is what
-    drives the network-token mint (checkout_url → open_url passkey → poll to ACTIVE →
+    `select-method` the card the user chose. That row `carries` `payment_brand="unionpay"`, which is
+    what drives the network-token mint (checkout_url → open_url passkey → poll to ACTIVE →
     payment_token_id). If you instead pass `payment_method_id` in the setup submit, the picker/select
     step is skipped, `payment_brand` is never captured, the token is silently NOT minted, and the
     turn dead-ends — so always go through `select-method`.
@@ -532,9 +605,10 @@ PAYMENT — runs in its OWN session (BRAND-AGNOSTIC: UnionPay OR EVO Visa/Master
     act(session_id, component, action, payload) — do NOT send natural-language send_message there
     (free text in a payment sub-flow gets misrouted to hotel-search / refused). Reuse ONE payment
     session_id for the whole sub-flow; do not open a new session per step.
-  • When you have a usable credential, attach it to the booking `confirm` payload. The confirm card's
-    action `carries` names the field (e.g. payment_token_id or payment_method_id). Omit payment to
-    let the platform charge the developer's default.
+  • When you have the user-chosen credential, attach it to the booking `confirm` payload. The confirm
+    card's action `carries` names the field (e.g. payment_token_id or payment_method_id). Do NOT omit
+    it to let the platform charge a default — a confirm that settles money must always carry the
+    payment method the user explicitly selected.
 
 RIDES — resolve on the client BEFORE submitting a ride search
   • The ride backend does NOT geocode. Resolve BOTH pickup and dropoff with resolve_location(addr)
