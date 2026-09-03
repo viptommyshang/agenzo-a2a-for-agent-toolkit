@@ -57,9 +57,10 @@ HTTP_TIMEOUT = float(_env("AGENZO_A2A_HTTP_TIMEOUT", "180") or "180")
 # tool output hides (it returns a normalized {state, text, cards[]} view). These settings turn
 # that raw visibility on.
 #
-# DEBUG: when true, every tool result carries the exact ``raw_request`` (JSON-RPC body sent)
-#   and ``raw_response`` (response body received, SSE or JSON) for the last A2A exchange, and
-#   each exchange is logged at DEBUG level (see setup_logging).
+# DEBUG: when true, each A2A exchange (request body + response) is LOGGED at DEBUG level (see
+#   setup_logging → stderr, plus LOG_FILE when set). It is deliberately NOT inlined into tool
+#   results — that would bloat the chat context. Use the ``inspect`` tool to view raw traffic on
+#   demand (works regardless of this flag).
 DEBUG = _bool("AGENZO_A2A_DEBUG", False)
 # LOG_FILE: optional path; when set, logs are also written there (in addition to stderr). Never
 #   write logs to stdout — in stdio transport stdout is the MCP protocol channel.

@@ -32,9 +32,17 @@ schema-driven, new domains (added as orchestrator schemas) work here with **no c
 
 ## Prerequisites
 
-- The orchestrator running (default `http://localhost:8000`) and its platform (`:8001`).
+- The orchestrator (orchestrator-base) running (default `http://localhost:8000`) and its platform (`:8001`).
 - A developer `api_key` **or** an invitation code. See auth below.
 - [`uv`](https://docs.astral.sh/uv/) installed (the server is launched with `uv run`).
+
+> **Routing behind a gateway.** `AGENZO_A2A_BASE_URL` must reach orchestrator-base on **two**
+> surfaces: `/a2a/*` (conversation, Bearer token) and `/orch-public/*` (auth-free: agent onboarding
+> `register`/`token`, ride geocoding tools `resolve_location`/`resolve_pickup_time`, and the EVO
+> Drop-in page). The client obtains its token via `POST /orch-public/auth/token`, so onboarding and
+> conversation land on the **same** service and the token verifies. When deploying behind a public
+> gateway, proxy **both** prefixes to orchestrator-base (a human-login `/api/v1/auth/*` gateway route
+> may point at a different orchestrator and is not used by this client).
 
 ## Configuration
 
@@ -51,8 +59,9 @@ Set these via the `env` block in `.kiro/settings/mcp.json` (recommended) or a lo
     reference scripts already created), or
   - `AGENZO_A2A_INVITATION_CODE` — self-register when no key is found (key is cached for reuse).
 - Debugging / raw protocol visibility (all optional):
-  - `AGENZO_A2A_DEBUG` — `1` to attach the exact `raw_request` / `raw_response` to every tool result
-    and log each exchange; `0` (default) keeps output normalized.
+  - `AGENZO_A2A_DEBUG` — `1` to LOG each A2A exchange (request + response) to stderr (and to
+    `AGENZO_A2A_LOG_FILE` when set); `0` (default) stays quiet. It does **not** inline the raw
+    traffic into tool results (that would bloat the chat context) — use `inspect()` for that.
   - `AGENZO_A2A_LOG_FILE` — path to also write request/response traces to (in addition to stderr).
   - `AGENZO_A2A_DEBUG_BUFFER` — how many recent exchanges `inspect()` keeps in memory (default `50`).
   - `AGENZO_A2A_DEBUG_MAXLEN` — char cap applied to surfaced request/response bodies (default
@@ -111,11 +120,12 @@ real request/response — expose it two ways:
 1. **`inspect(session_id?, limit?)`** — dumps the captured exchanges regardless of any flag. Each
    entry has the exact `request` body, the `response_raw` text plus structured `response_json`
    (blocking) or `response_frames` (streamed SSE), the `url` / `status` / `transport` / `context_id`,
-   and a `curl` line that reproduces the call (token shown as `$AGENZO_A2A_TOKEN`).
-2. **Debug mode** — set `AGENZO_A2A_DEBUG=1` (env) or call `configure(debug="1")`; every tool result
-   then also carries `raw_request` / `raw_response` / `raw_exchange`, and each exchange is logged
-   (stderr, plus `AGENZO_A2A_LOG_FILE` if set). In stdio transport, logs go to **stderr only** —
-   stdout is the MCP protocol channel.
+   and a `curl` line that reproduces the call (token shown as `$AGENZO_A2A_TOKEN`). This is the
+   primary way to view raw traffic — it never pollutes the chat context unless you ask for it.
+2. **Debug logging** — set `AGENZO_A2A_DEBUG=1` (env) or call `configure(debug="1")`; each exchange
+   is then LOGGED (request + response) to stderr, plus `AGENZO_A2A_LOG_FILE` when set. The raw
+   traffic is **not** inlined into tool results (that would bloat the chat context). In stdio
+   transport, logs go to **stderr only** — stdout is the MCP protocol channel.
 
 A captured `book(...)` turn looks like this on the wire:
 
@@ -145,5 +155,8 @@ Payment runs in its own session. `start_payment` returns your ACTIVE cards; **EV
 `checkout_url` passkey (Kiro opens it via `open_url`, you complete it, then it polls to `ACTIVE`
 and gets a `payment_token_id`). The resulting id is attached to the booking `confirm`.
 
-Security: this is a client only — it adds no network-exposed endpoints. It talks to the local
-orchestrator with a short-lived Bearer token and can open your browser for checkout/enrollment.
+Security: this is a client only — it adds no network-exposed endpoints. It talks to the
+orchestrator on two surfaces: the **conversation** surface `/a2a/*` with a short-lived Bearer token
+(obtained via the auth-free `/orch-public/auth/token`), and the **auth-free** `/orch-public/*`
+surface (onboarding, ride geocoding, EVO Drop-in page). It can also open your browser for
+checkout / card enrollment. The Bearer token is issued by orchestrator-base and only sent to it.

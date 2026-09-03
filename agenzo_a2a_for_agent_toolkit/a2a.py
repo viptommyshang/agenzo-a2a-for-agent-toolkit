@@ -387,7 +387,9 @@ class A2ABridge:
             pass
 
     async def _register(self) -> str:
-        url = f"{self.cfg.BASE_URL}/api/v1/auth/register"
+        # 通用免鉴权前缀下的 A2A 上线端点：公网部署时 nginx 把 /orch-public/* 与 /a2a/* 一起反代到
+        # orchestrator-base，故 register/token 与后续 /a2a 落到同一服务（token 由该服务验签）。
+        url = f"{self.cfg.BASE_URL}/orch-public/auth/register"
         payload: dict[str, str] = {"name": self.cfg.AGENT_NAME}
         if self.cfg.INVITATION_CODE:
             payload["invitation_code"] = self.cfg.INVITATION_CODE
@@ -409,7 +411,8 @@ class A2ABridge:
         )
 
     async def _exchange_token(self, api_key: str) -> str:
-        url = f"{self.cfg.BASE_URL}/api/v1/auth/token"
+        # 见 _register：走通用免鉴权前缀，确保与 /a2a 落到同一 orchestrator-base（token 同源验签）。
+        url = f"{self.cfg.BASE_URL}/orch-public/auth/token"
         try:
             resp = await self._client.post(url, json={"api_key": api_key, "member_id": self._member_id})
         except httpx.HTTPError as exc:
@@ -487,7 +490,7 @@ class A2ABridge:
         return resp.status_code, resp.text
 
     async def call_tool(self, path: str, payload: dict[str, Any]) -> tuple[int, str]:
-        """POST a JSON payload to an authed orchestrator utility endpoint (e.g. ``/tools/resolve-location``).
+        """POST a JSON payload to an orchestrator utility endpoint (e.g. ``/orch-public/tools/resolve-location``).
 
         Mirrors :meth:`_drive`'s single 401 re-auth retry, but targets a plain HTTP endpoint (not the
         A2A message transport). Used by the geocoding / pickup-time tools so the chat agent can resolve

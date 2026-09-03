@@ -25,11 +25,14 @@ Tools
 
 Protocol visibility
 -------------------
-The normal tools return a normalized ``{state, text, cards[]}`` view of each A2A Task. Because this
-bridge is primarily a *debugging* tool, the exact A2A protocol is also exposed: set
-``AGENZO_A2A_DEBUG=1`` (or ``configure(debug="1")``) to attach ``raw_request`` / ``raw_response`` to
-every result and log each exchange, and/or call ``inspect()`` any time to dump the captured raw
-JSON-RPC traffic (request body, response frames, and a ``curl`` reproduction).
+The normal tools return a normalized ``{state, text, cards[]}`` view of each A2A Task — the exact
+JSON-RPC traffic is NEVER inlined into tool results (that would bloat the chat context). To see the
+raw A2A protocol:
+  - Set ``AGENZO_A2A_DEBUG=1`` (or ``configure(debug="1")``) to LOG each exchange (request body +
+    response) to stderr, and to ``AGENZO_A2A_LOG_FILE`` when that path is configured. This goes to
+    the log only, not into the model context.
+  - Call ``inspect()`` any time (independent of the flag) to pull the captured raw exchanges on
+    demand: request body, response frames, ``url``/``status``, and a ``curl`` reproduction.
 """
 
 from __future__ import annotations
@@ -91,71 +94,47 @@ def _ctx(session_id: str) -> str:
     return s["context_id"] if s else session_id
 
 
-def _attach_debug(out: dict[str, Any], context_id: str | None = None) -> dict[str, Any]:
-    """When debug is on, attach the exact A2A request/response for the last exchange.
-
-    Adds ``raw_request`` (the JSON-RPC body sent), ``raw_response`` (structured when possible, else
-    the raw text) and ``raw_exchange`` (full detail: url, status, curl repro). This is what a direct
-    A2A integrator needs to see, which the normalized output otherwise hides. No-op when debug is
-    off — use the ``inspect`` tool for on-demand access regardless of the flag."""
-    bridge = _get_bridge()
-    if not bridge.debug:
-        return out
-    record = bridge.last_exchange(context_id)
-    if record is None:
-        return out
-    view = exchange_view(record, maxlen=cfg.DEBUG_MAXLEN)
-    out["raw_request"] = view.get("request")
-    out["raw_response"] = view.get("response_json") or view.get("response_frames") or view.get("response_raw")
-    out["raw_exchange"] = view
-    return out
-
-
 def _result(session_id: str, status: int, raw: str) -> dict[str, Any]:
-    """Normalize an A2A response into a chat-friendly dict (or an error)."""
-    ctx = _ctx(session_id)
+    """Normalize an A2A response into a chat-friendly dict (or an error).
+
+    The raw A2A request/response is deliberately NOT inlined here (it would bloat the chat context).
+    When ``AGENZO_A2A_DEBUG`` is on, each exchange is written to the log (stderr + ``AGENZO_A2A_LOG_FILE``
+    if set); use the ``inspect`` tool to pull the exact JSON-RPC traffic on demand."""
     if status != 200:
-        return _attach_debug(
-            {
-                "session_id": session_id,
-                "error": f"orchestrator returned HTTP {status}",
-                "detail": _short(raw),
-                "cards": [],
-                "text": "",
-            },
-            ctx,
-        )
+        return {
+            "session_id": session_id,
+            "error": f"orchestrator returned HTTP {status}",
+            "detail": _short(raw),
+            "cards": [],
+            "text": "",
+        }
     task = final_task(raw)
     if task is None:
-        return _attach_debug(
-            {
-                "session_id": session_id,
-                "error": "no A2A Task in response",
-                "detail": _short(raw),
-                "cards": [],
-                "text": "",
-            },
-            ctx,
-        )
+        return {
+            "session_id": session_id,
+            "error": "no A2A Task in response",
+            "detail": _short(raw),
+            "cards": [],
+            "text": "",
+        }
     out = normalize_task(task)
     out["session_id"] = session_id
     out["member_id"] = _get_bridge().member_id
-    return _attach_debug(out, ctx)
+    return out
 
 
 def _tool_result(status: int, raw: str) -> dict[str, Any]:
-    """Parse a plain JSON response from an orchestrator utility endpoint (e.g. ``/tools/*``).
+    """Parse a plain JSON response from an orchestrator utility endpoint (e.g. ``/orch-public/tools/*``).
 
     On non-200 or non-JSON, surface a compact error dict instead of raising — the chat agent then
     knows geocoding is unavailable and can ask the user for coordinates."""
     if status != 200:
-        return _attach_debug({"error": f"orchestrator returned HTTP {status}", "detail": _short(raw)})
+        return {"error": f"orchestrator returned HTTP {status}", "detail": _short(raw)}
     try:
         obj = json.loads(raw)
     except json.JSONDecodeError:
-        return _attach_debug({"error": "invalid JSON from orchestrator", "detail": _short(raw)})
-    out = obj if isinstance(obj, dict) else {"error": "unexpected response", "detail": _short(raw)}
-    return _attach_debug(out)
+        return {"error": "invalid JSON from orchestrator", "detail": _short(raw)}
+    return obj if isinstance(obj, dict) else {"error": "unexpected response", "detail": _short(raw)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -209,8 +188,10 @@ async def configure(
       - agent_name: display name for registration (default "kiro-agent")
       - stream: "1" for streaming, "0" for blocking
       - http_timeout: timeout in seconds (default "180")
-      - debug: "1" to attach the exact A2A ``raw_request``/``raw_response`` to every tool result
-        (and log each exchange), "0" to turn it off. The ``inspect`` tool works regardless.
+      - debug: "1" to LOG each A2A exchange (request + response) to stderr (and to ``log_file`` when
+        set), "0" to turn it off. It does NOT inline the raw traffic into tool results — that would
+        bloat the chat context. Use the ``inspect`` tool (works regardless of this flag) to view the
+        raw JSON-RPC on demand.
       - log_file: optional path to also write request/response traces to (in addition to stderr).
 
     Returns the active configuration (secrets masked)."""
@@ -273,9 +254,16 @@ async def book(request: str, member_id: str = "") -> dict[str, Any]:
     """Start a NEW booking conversation from a natural-language request and return the first
     card(s).
 
-    Examples of ``request``:
-      - "Book a one-way economy flight from Shanghai to Beijing on August 24th for 1 adult."
-      - "Book a hotel near the Bund in Shanghai, 1 adult, check-in Aug 18, check-out Aug 19."
+    IMPORTANT — pass the user's request VERBATIM and COMPLETE. Do NOT summarize or trim it: keep
+    every detail the user stated, especially the traveler/guest NAME, PHONE and EMAIL. The server
+    prefills the entry form by extracting fields from exactly this text, so dropping the name/phone
+    forces an avoidable extra round-trip asking for them again.
+
+    Examples of ``request`` (note the contact details are kept in):
+      - "Book a one-way economy flight from Shanghai to Beijing on August 24th for 1 adult.
+        Passenger: Richard Chen, passport E1234567, phone +86 13275666789, richard@example.com."
+      - "Book a hotel near the Bund in Shanghai, 1 adult, check-in Aug 18, check-out Aug 19.
+        Guest Richard Chen, phone 13275666789."
 
     Returns ``{session_id, cards, text, state, primary_component, member_id}``. Read the last card's
     ``component``/``data``/``actions`` and advance with ``act(session_id, ...)``; use
@@ -346,29 +334,54 @@ async def start_payment(
     amount_cents: int, recipient_name: str, recipient_account: str = "", member_id: str = ""
 ) -> dict[str, Any]:
     """Start a SEPARATE payment session (independent context) to pick/verify a payment method BEFORE
-    confirming an order. Returns the method-picker card listing the member's payment methods (each
-    row carries an ``id`` and a ``payment_brand``).
+    confirming an order. This is BRAND-AGNOSTIC — it returns the method-picker card listing ALL the
+    member's payment methods (UnionPay AND EVO Visa/Mastercard); each row carries an ``id`` and a
+    ``payment_brand``. It does NOT force UnionPay.
 
     Then drive it card-first with ``act(payment_session_id, ...)`` — read each card's ``actions`` /
     ``item_actions`` and follow the generic loop (see ``guide()``); do not assume component names:
       - Pick a listed method with its row action (it ``carries`` the ``id`` + ``payment_brand``).
-        A method usable without extra steps yields an id you attach to the booking confirm (the
-        confirm action's ``carries`` names the field, e.g. ``payment_method_id``).
+        The routing follows the CHOSEN card's brand: an EVO card (Visa/Mastercard) is returned
+        directly as ``payment_method_id`` (no passkey); a UnionPay card mints a network-token via a
+        passkey (open_url → poll to ACTIVE) yielding ``payment_token_id``. Attach whichever the
+        confirm action ``carries`` names.
       - If selecting a method returns a card with an ``open_url`` action (passkey / enrollment /
         Drop-in), call ``open_url`` on the URL at that card's ``data`` field, have the user finish,
         send the action's ``callback`` id, then ``poll(session_id, component)`` until
         ``data.status == "ACTIVE"``. Use the resulting credential in the booking confirm.
-      - No method listed / want a new one: use the picker's scenario-jump action (an action carrying
-        a ``scenario``, e.g. "add-method") to enter the add-a-method flow, then follow its cards.
+      - NO method listed / want a NEW card: use the picker's scenario-jump action (``add-method``)
+        to bind one, then submit the add-method form. That form REQUIRES ``user_email`` and takes an
+        optional ``brand`` that CHOOSES the card type: ``brand:"evo"`` binds a Visa/Mastercard (EVO
+        Drop-in), any other/absent value binds a UnionPay card. So to add a Mastercard, submit
+        ``{"user_email": "...", "brand": "evo"}`` — omitting ``brand`` defaults to UnionPay.
 
-    ``amount_cents`` = order total × 100. ``recipient_account`` (phone or email) is REQUIRED for
-    UnionPay, may be empty for EVO. ``member_id`` (optional) must match the booking's member."""
+    Drive this session with STRUCTURED ``act(...)`` calls ONLY — do not send natural-language
+    ``send_message`` here (free text in a payment sub-flow gets misrouted). Reuse THIS session for
+    the whole payment sub-flow (pick / add-method / mint), don't open a new one per step.
+
+    After you BIND a UnionPay card, mint its token BY PICKING IT: call ``start_payment`` again (or
+    reuse this session), read ``payment.method-list``, and ``select-method`` the bound card (its row
+    ``carries`` ``payment_brand="unionpay"``, which drives the network-token mint). Do NOT pass
+    ``payment_method_id`` into the ``payment.setup`` submit — that skips the picker, leaves
+    ``payment_brand`` uncaptured, and the token is silently never minted.
+
+    ``amount_cents`` = order total × 100. ``recipient_account`` (phone or email) is only needed for
+    the UnionPay network-token branch; leave it empty for EVO. ``member_id`` (optional) must match
+    the booking's member."""
     bridge = _get_bridge()
     if member_id:
         await bridge.set_member(member_id)
     sid = _new_session("payment")
     try:
-        status, raw = await bridge.send_text(_ctx(sid), "Prepare a UnionPay payment.")
+        # Brand-neutral routing seed. The orchestrator classifies intent by *literal substring*
+        # match against the pay-setup keywords ("prepare payment" / "select payment method"), and
+        # normalize() only lowercases + folds whitespace (it does NOT drop stop-words). So the seed
+        # MUST contain one of those keywords VERBATIM as a substring — e.g. "prepare a payment" does
+        # NOT match ("a" splits the phrase), which silently drops the payment scenario and makes the
+        # follow-up payment.setup#submit fall back to a context-less agent turn (guard refusal).
+        # Keep an exact keyword substring here, and keep it brand-neutral (do NOT presuppose UnionPay;
+        # the picker lists all brands and routes by the card the user actually picks).
+        status, raw = await bridge.send_text(_ctx(sid), "Prepare payment. Select payment method.")
         if status != 200:
             return _result(sid, status, raw)
         status, raw = await bridge.send_action(
@@ -423,7 +436,7 @@ async def resolve_location(address: str) -> dict[str, Any]:
     is unconfigured/fails — then ask the user for exact coordinates."""
     bridge = _get_bridge()
     try:
-        status, raw = await bridge.call_tool("/tools/resolve-location", {"address": address})
+        status, raw = await bridge.call_tool("/orch-public/tools/resolve-location", {"address": address})
     except AuthError as exc:
         return {"error": f"auth failed: {exc}"}
     except Exception as exc:  # noqa: BLE001
@@ -446,7 +459,7 @@ async def resolve_pickup_time(local_datetime: str, timezone: str) -> dict[str, A
     bridge = _get_bridge()
     try:
         status, raw = await bridge.call_tool(
-            "/tools/resolve-pickup-time",
+            "/orch-public/tools/resolve-pickup-time",
             {"local_datetime": local_datetime, "timezone": timezone},
         )
     except AuthError as exc:
@@ -479,8 +492,11 @@ BUILDING THE PAYLOAD — read it from the card, do not guess
   • An action may declare `carries: [f1, f2, …]`  ->  payload = EXACTLY those fields, copied from the
     card's `data`. For a list-row action (in `item_actions`), copy them from the chosen row's data.
   • A form card (kind="form") `submit`/`confirm`  ->  payload = the fields present in the card's
-    `data` (already-prefilled values) plus anything the user supplied. If a required value is
-    missing, ASK the user (or send_message(session_id, "...")) — never fabricate it.
+    `data` (already-prefilled values) PLUS every field the user has ALREADY stated anywhere in the
+    conversation (e.g. traveler/guest name, phone, email — even if the card didn't prefill them).
+    Send them all in the FIRST submit; only when a value is genuinely unknown do you ASK the user
+    (or send_message(session_id, "...")). Never fabricate a value, and never drop one you already
+    have — omitting known name/phone/email just triggers an extra "please provide …" round-trip.
   • An action with `scenario: "<name>"` is a SCENARIO JUMP (e.g. adding a payment method): sending it
     returns that scenario's entry card; then keep following the same loop.
   • An action with `dispatch:"client"` + `capability:"open_url"` needs an out-of-band browser page:
@@ -492,12 +508,30 @@ ANSWERING THE SERVER
   • A response with `text` and no cards means the server is asking/telling you something  ->  reply
     with send_message(session_id, text).
 
-PAYMENT — runs in its OWN session
+PAYMENT — runs in its OWN session (BRAND-AGNOSTIC: UnionPay OR EVO Visa/Mastercard)
   • Booking + payment MUST share the same member_id.
   • start_payment(amount_cents, recipient_name, recipient_account) opens a SEPARATE payment session
-    and returns a card to pick/verify a payment method. Drive it with act(payment_session_id, ...)
-    exactly like the loop above — including any `scenario`-jump action to add a new method, and
-    open_url for a passkey / enrollment / Drop-in page, then poll the await card to "ACTIVE".
+    and returns a picker listing ALL the member's cards (any brand). Drive it with
+    act(payment_session_id, ...) like the loop above. Routing follows the card you PICK: an EVO card
+    is returned directly as payment_method_id; a UnionPay card mints a token via a passkey (open_url
+    → poll to ACTIVE) → payment_token_id.
+  • If the picker is EMPTY (no cards) or the user wants a new one, send the `add-method` action, then
+    submit the add-method form. It REQUIRES `user_email`, and `brand` CHOOSES the card type:
+    `brand:"evo"` → Visa/Mastercard (EVO Drop-in); omitted/other → UnionPay. Don't default to
+    UnionPay silently — if the user hasn't said which, ASK whether they want UnionPay or a
+    Visa/Mastercard, then pass the matching `brand`.
+  • AFTER binding a UnionPay card, MINT THE TOKEN BY PICKING THE CARD — do NOT shortcut. Reuse the
+    SAME payment session: submit `payment.setup` with ONLY {amount_cents, recipient_name,
+    recipient_account} (do NOT put payment_method_id in it), read the `payment.method-list`, then
+    `select-method` the just-bound card. That row `carries` `payment_brand="unionpay"`, which is what
+    drives the network-token mint (checkout_url → open_url passkey → poll to ACTIVE →
+    payment_token_id). If you instead pass `payment_method_id` in the setup submit, the picker/select
+    step is skipped, `payment_brand` is never captured, the token is silently NOT minted, and the
+    turn dead-ends — so always go through `select-method`.
+  • DRIVE PAYMENT WITH STRUCTURED ACTIONS ONLY. Inside a payment/add-method session use
+    act(session_id, component, action, payload) — do NOT send natural-language send_message there
+    (free text in a payment sub-flow gets misrouted to hotel-search / refused). Reuse ONE payment
+    session_id for the whole sub-flow; do not open a new session per step.
   • When you have a usable credential, attach it to the booking `confirm` payload. The confirm card's
     action `carries` names the field (e.g. payment_token_id or payment_method_id). Omit payment to
     let the platform charge the developer's default.
