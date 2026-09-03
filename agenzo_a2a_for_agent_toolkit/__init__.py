@@ -7,8 +7,9 @@ protocol. The chat agent reads each returned card and picks the next action, so 
 flight or ride happens right here in the conversation.
 
 Because this bridge is primarily a *debugging* tool, the exact A2A JSON-RPC request/response is
-also inspectable: set ``AGENZO_A2A_DEBUG=1`` to attach ``raw_request``/``raw_response`` to every
-result (and log each exchange), or call ``inspect()`` any time to dump the captured raw traffic.
+also inspectable — but it is NEVER inlined into tool results (that would bloat the chat context):
+call ``inspect()`` any time to dump the captured raw traffic, and/or set ``AGENZO_A2A_DEBUG=1`` to
+LOG each exchange to stderr (and to ``AGENZO_A2A_LOG_FILE`` when set).
 """
 
 __version__ = "0.1.0"
