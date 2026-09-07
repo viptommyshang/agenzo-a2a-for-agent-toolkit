@@ -8,6 +8,25 @@ one of ``actions[].id`` with a payload built from the previous card's ``data``. 
 thin, **stateful** bridge over that protocol — the chat agent is the client that reads cards, asks
 the user what it needs, and calls the next tool. New domains/schemas work with zero changes here.
 
+Standalone payment & refund (merchant-independent)
+--------------------------------------------------
+Besides paying WITHIN an order (see ``start_payment``), the platform exposes two standalone,
+merchant-independent flows — just ``book(...)`` them in natural language and drive with ``act(...)``
+like any other scenario (no code changes here):
+  - **make a payment** (``pay`` scenario): pick a bound card, then a **confirm card**
+    (``payment.pay-confirm``) shows amount + currency — you MUST get the USER's explicit ``confirm``
+    before any money moves. Routing follows the chosen card's brand, same generic loop: UnionPay →
+    ``payment.action-required`` (``open_url`` passkey → ``paid`` → poll) then the charge is captured
+    and ``payment.pay-result`` is returned; Mastercard/EVO → ``payment.card-action-required``
+    (``open_url`` 3DS → ``paid`` → ``poll`` ``payment.card-await`` until terminal) then
+    ``payment.card-result``. A successful charge returns a ``charge_no`` — keep it for refunds.
+  - **refund** (``refund`` scenario): give the ``charge_no`` (or ``payment_token_id``) and an optional
+    partial amount; a **confirm card** (``payment.refund-confirm``) requires the USER's explicit
+    ``confirm`` before the refund is issued; ``payment.refund-result`` returns the outcome.
+Never auto-confirm a funds action (pay/refund) — always surface the confirm card's amount to the
+user and only send ``confirm`` after they approve. Drive the whole sub-flow with structured
+``act(...)`` (no free-text ``send_message`` mid-payment).
+
 Tools
 -----
 - ``discover()``            – agent card (which domains/skills are bookable).
@@ -152,8 +171,13 @@ def _settle_without_payment(component: str, action: str, payload: dict[str, Any]
     if (action or "").strip().lower() not in _SETTLE_ACTIONS:
         return False
     comp = (component or "").lower()
-    # Skip actions that do NOT charge the card (cancellations, refunds, void, check-out).
-    if any(k in comp for k in ("cancel", "refund", "void", "checkout", "check-out")):
+    # Skip actions that do NOT charge the card (cancellations, refunds, void, check-out), and the
+    # STANDALONE payment scenario's own confirm (``payment.pay-confirm``): there the card is chosen
+    # in-flow via ``select-method`` and threaded through ``$collected`` — it is not a merchant order
+    # confirm that must carry a payment credential in its payload, so the advisory would misfire.
+    # ("pay-confirm" is deliberately NOT a substring of "ride.payment-confirm", so merchant confirms
+    # stay flagged.)
+    if any(k in comp for k in ("cancel", "refund", "void", "checkout", "check-out", "pay-confirm")):
         return False
     if not any(k in comp for k in ("confirm", "booking", "payment", "order")):
         return False
@@ -379,7 +403,14 @@ async def poll(session_id: str, component: str) -> dict[str, Any]:
 async def start_payment(
     amount_cents: int, recipient_name: str, recipient_account: str = "", member_id: str = ""
 ) -> dict[str, Any]:
-    """Start a SEPARATE payment session (independent context) to pick/verify a payment method BEFORE
+    """MERCHANT-ORDER PRE-PAYMENT ONLY. Use this to pick/mint a payment credential to attach to a
+    booking ``confirm`` (hotel/flight/ride): it drives the payment ``pay-setup`` scenario and by
+    itself NEVER charges the card (no charge, no ``charge_no``). For a STANDALONE payment (charge a
+    card directly and get a refundable ``charge_no``) or a REFUND, do NOT call this — start those
+    from ``book(...)`` with a natural-language request (e.g. "make a payment of 44.33 USD, cardholder
+    phone +1..." or "refund charge chg_..."), then drive the returned cards with ``act(...)``.
+
+    Start a SEPARATE payment session (independent context) to pick/verify a payment method BEFORE
     confirming an order. This is BRAND-AGNOSTIC — it returns the method-picker card listing ALL the
     member's payment methods (UnionPay AND EVO Visa/Mastercard); each row carries an ``id`` and a
     ``payment_brand``. It does NOT force UnionPay.
