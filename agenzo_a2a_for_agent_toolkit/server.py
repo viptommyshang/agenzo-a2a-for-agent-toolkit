@@ -10,7 +10,7 @@ the user what it needs, and calls the next tool. New domains/schemas work with z
 
 Standalone payment & refund (merchant-independent)
 --------------------------------------------------
-Besides paying WITHIN an order (see ``start_payment``), the platform exposes two standalone,
+Besides paying WITHIN an order (see ``start_payment``), the platform exposes three standalone,
 merchant-independent flows — just ``book(...)`` them in natural language and drive with ``act(...)``
 like any other scenario (no code changes here):
   - **make a payment** (``pay`` scenario): pick a bound card, then a **confirm card**
@@ -23,6 +23,14 @@ like any other scenario (no code changes here):
   - **refund** (``refund`` scenario): give the ``charge_no`` (or ``payment_token_id``) and an optional
     partial amount; a **confirm card** (``payment.refund-confirm``) requires the USER's explicit
     ``confirm`` before the refund is issued; ``payment.refund-result`` returns the outcome.
+  - **create a network token** (``create-token`` scenario): mint a REUSABLE network token for a
+    bound card WITHOUT charging — pick a card, then it is minted by the CARD BRAND on ALL THREE
+    rails: UnionPay (``open_url`` checkout passkey → poll to ACTIVE), Visa (``open_url`` payment_url
+    FIDO passkey → poll to ACTIVE), or EVO/Mastercard (SYNCHRONOUS — no browser step). No charge
+    and no ``charge_no`` occur; ``payment.token-result`` returns the ``payment_token_id`` (+ status).
+    NOTE: minting is NOT UnionPay-only here — EVERY listed brand mints. (This differs from
+    ``start_payment`` / ``pay``, where only UnionPay mints and EVO/Visa are handed back as a
+    ``payment_method_id``.)
 Never auto-confirm a funds action (pay/refund) — always surface the confirm card's amount to the
 user and only send ``confirm`` after they approve. Drive the whole sub-flow with structured
 ``act(...)`` (no free-text ``send_message`` mid-payment).
@@ -409,6 +417,11 @@ async def start_payment(
     card directly and get a refundable ``charge_no``) or a REFUND, do NOT call this — start those
     from ``book(...)`` with a natural-language request (e.g. "make a payment of 44.33 USD, cardholder
     phone +1..." or "refund charge chg_..."), then drive the returned cards with ``act(...)``.
+    To CREATE A STANDALONE NETWORK TOKEN (mint-only, no charge) do NOT call this either — that is
+    the ``create-token`` scenario via book("create a network token …"), and it mints on ALL THREE
+    rails (UnionPay / Visa / EVO). The "only a UnionPay card mints a network-token; EVO/Visa handed
+    back as ``payment_method_id``" behavior described below is specific to THIS merchant pre-payment
+    path.
 
     Start a SEPARATE payment session (independent context) to pick/verify a payment method BEFORE
     confirming an order. This is BRAND-AGNOSTIC — it returns the method-picker card listing ALL the
@@ -624,6 +637,12 @@ PAYMENT — runs in its OWN session (BRAND-AGNOSTIC: UnionPay OR EVO Visa/Master
         Never pick the brand for the user.
   • Routing follows the card the USER picked: an EVO card is returned directly as payment_method_id;
     a UnionPay card mints a token via a passkey (open_url → poll to ACTIVE) → payment_token_id.
+  • STANDALONE TOKEN CREATION is different: the ``create-token`` scenario (start it with
+    book("create a network token …")) mints a reusable network token on ALL THREE rails — UnionPay
+    (passkey), Visa (FIDO passkey), and EVO/Mastercard (synchronous, no browser). So do NOT tell the
+    user network tokens are "UnionPay-only", and do NOT steer them to add a UnionPay card just to
+    mint one — any listed card (including an EVO Mastercard) can be minted. The rule above (only
+    UnionPay mints, EVO/Visa handed back) applies ONLY to paying an order via start_payment/pay.
   • AFTER binding a UnionPay card, MINT THE TOKEN BY PICKING THE CARD — do NOT shortcut. Reuse the
     SAME payment session: submit `payment.setup` with ONLY {amount_cents, recipient_name,
     recipient_account} (do NOT put payment_method_id in it), read the `payment.method-list`, then
