@@ -164,8 +164,12 @@ def _tool_result(status: int, raw: str) -> dict[str, Any]:
     return obj if isinstance(obj, dict) else {"error": "unexpected response", "detail": _short(raw)}
 
 
-# Actions that SETTLE money (place/charge an order). Kept small on purpose to avoid false positives.
+# Actions that SETTLE money (place/charge an order). WHICH action charges depends on the domain:
+# most domains charge at the order confirm/book, but HOTEL is lock-then-pay — its booking-confirm
+# only LOCKS inventory (no money), and the charge (with the user-chosen card) is on `pay`
+# (hotel.order-detail). Kept small on purpose to avoid false positives.
 _SETTLE_ACTIONS = {"confirm", "book"}
+_HOTEL_SETTLE_ACTIONS = {"pay"}
 # Fields that carry an explicit, user-chosen payment credential on a settle action.
 _PAYMENT_FIELDS = ("payment_method_id", "payment_token_id")
 
@@ -176,8 +180,7 @@ def _settle_without_payment(component: str, action: str, payload: dict[str, Any]
     forwarded to the orchestrator (any HARD stop belongs in the orchestrator/merchant backend, not
     in this thin bridge). Deliberately narrow (settle actions on booking/payment cards only) so it
     does not fire on unrelated confirms such as cancellations."""
-    if (action or "").strip().lower() not in _SETTLE_ACTIONS:
-        return False
+    act = (action or "").strip().lower()
     comp = (component or "").lower()
     # Skip actions that do NOT charge the card (cancellations, refunds, void, check-out), and the
     # STANDALONE payment scenario's own confirm (``payment.pay-confirm``): there the card is chosen
@@ -187,17 +190,27 @@ def _settle_without_payment(component: str, action: str, payload: dict[str, Any]
     # stay flagged.)
     if any(k in comp for k in ("cancel", "refund", "void", "checkout", "check-out", "pay-confirm")):
         return False
+    # HOTEL is lock-then-pay: its booking-confirm only LOCKS inventory (no money) — the charge, with
+    # the user-chosen card, is on `pay` (hotel.order-detail). Every other domain charges at the order
+    # confirm/book. (Hotel's 3DS `resume` reuses a persisted preauth and is intentionally NOT here.)
+    # Selecting the settle action per-domain avoids BOTH a false-positive on hotel's non-charging
+    # booking-confirm AND a miss on hotel's charging `pay`.
+    settle_actions = _HOTEL_SETTLE_ACTIONS if "hotel" in comp else _SETTLE_ACTIONS
+    if act not in settle_actions:
+        return False
     if not any(k in comp for k in ("confirm", "booking", "payment", "order")):
         return False
     return not any(str((payload or {}).get(f) or "").strip() for f in _PAYMENT_FIELDS)
 
 
 _PAYMENT_WARNING = (
-    "POLICY WARNING: this order confirmation carried NO user-chosen payment method "
+    "POLICY WARNING: this money-settling order action carried NO user-chosen payment method "
     "(payload had neither payment_method_id nor payment_token_id). You must resolve payment via "
-    "start_payment() and let the USER pick a card BEFORE confirming — omitting it can cause a "
-    "silent charge to a platform/member default card. If this order settles money, verify or cancel "
-    "it, then redo the confirm carrying the payment credential the user explicitly selected."
+    "start_payment() and let the USER pick a card BEFORE this step — omitting it can cause a "
+    "silent charge to a platform/member default card. If this action settles money, verify or cancel "
+    "the order, then redo it carrying the payment credential the user explicitly selected. "
+    "(Hotel is lock-then-pay: it charges at `pay` on hotel.order-detail — attach the card THERE, not "
+    "at booking-confirm, which only locks the room.)"
 )
 
 
@@ -377,10 +390,13 @@ async def act(session_id: str, component: str, action: str, payload: dict[str, A
     Do not pick by price/distance/rating/position, and do not auto-pick even a single option — confirm
     it with the user first.
 
-    To attach a payment result to a booking confirm, include ``payment_token_id`` (UnionPay) or
-    ``payment_method_id`` (EVO/Visa/Mastercard) in the confirm ``payload`` (see ``start_payment``).
-    An order ``confirm``/``book`` that settles money MUST carry the payment method the USER explicitly
-    chose — never omit it to fall back to a platform/member default charge."""
+    To attach a payment result, include ``payment_token_id`` (UnionPay) or ``payment_method_id``
+    (EVO/Visa/Mastercard) in the payload of the action that SETTLES money (see ``start_payment``).
+    That action varies by domain: most domains charge at the order ``confirm``/``book``, but HOTEL is
+    lock-then-pay — its ``booking-confirm#confirm`` only LOCKS the room (no charge), and the payment
+    method goes on ``hotel.order-detail#pay``. Whichever action settles money MUST carry the payment
+    method the USER explicitly chose — never omit it to fall back to a platform/member default charge.
+    Read the action's ``carries`` to know which field name to send."""
     bridge = _get_bridge()
     payload = payload or {}
     try:
@@ -388,8 +404,9 @@ async def act(session_id: str, component: str, action: str, payload: dict[str, A
     except AuthError as exc:
         return {"session_id": session_id, "error": f"auth failed: {exc}", "cards": [], "text": ""}
     out = _result(session_id, status, raw)
-    # Non-blocking soft guardrail: flag a money-settling confirm that omitted an explicit,
-    # user-chosen payment method (see _settle_without_payment). The action is still forwarded.
+    # Non-blocking soft guardrail: flag a money-settling action (confirm/book, or hotel's `pay`)
+    # that omitted an explicit, user-chosen payment method (see _settle_without_payment). The
+    # action is still forwarded.
     if "error" not in out and _settle_without_payment(component, action, payload):
         out["payment_warning"] = _PAYMENT_WARNING
     return out
@@ -619,11 +636,14 @@ ANSWERING THE SERVER
 
 PAYMENT — runs in its OWN session (BRAND-AGNOSTIC: UnionPay OR EVO Visa/Mastercard)
   • Booking + payment MUST share the same member_id.
-  • MANDATORY — RESOLVE PAYMENT BEFORE EVERY ORDER. Before you send ANY order `confirm`/`book` that
-    settles money, you MUST first run start_payment(...) and let the USER choose how to pay. NEVER
-    confirm an order without an explicit, user-chosen payment credential — do NOT rely on, or fall
-    back to, any "platform / developer / member default" card. If you skip this, the backend may
-    silently charge whatever default it finds, which is exactly what must NOT happen.
+  • MANDATORY — RESOLVE PAYMENT BEFORE THE MONEY-SETTLING STEP. Before you send the order action
+    that settles money, you MUST first run start_payment(...) and let the USER choose how to pay.
+    WHICH step charges varies by domain: most domains charge at the order `confirm`/`book`, but
+    HOTEL is lock-then-pay — its booking-confirm only LOCKS the room (no charge) and the payment
+    goes on `pay` (hotel.order-detail). NEVER settle an order without an explicit, user-chosen
+    payment credential — do NOT rely on, or fall back to, any "platform / developer / member
+    default" card. If you skip this, the backend may silently charge whatever default it finds,
+    which is exactly what must NOT happen.
   • start_payment(amount_cents, recipient_name, recipient_account) opens a SEPARATE payment session
     and returns a picker listing ALL the member's cards (any brand). Drive it with
     act(payment_session_id, ...) like the loop above.
@@ -655,9 +675,10 @@ PAYMENT — runs in its OWN session (BRAND-AGNOSTIC: UnionPay OR EVO Visa/Master
     act(session_id, component, action, payload) — do NOT send natural-language send_message there
     (free text in a payment sub-flow gets misrouted to hotel-search / refused). Reuse ONE payment
     session_id for the whole sub-flow; do not open a new session per step.
-  • When you have the user-chosen credential, attach it to the booking `confirm` payload. The confirm
-    card's action `carries` names the field (e.g. payment_token_id or payment_method_id). Do NOT omit
-    it to let the platform charge a default — a confirm that settles money must always carry the
+  • When you have the user-chosen credential, attach it to the payload of the money-settling action
+    (most domains: the booking `confirm`; HOTEL: `pay` on hotel.order-detail — its booking-confirm
+    only locks). That action's `carries` names the field (e.g. payment_token_id or payment_method_id).
+    Do NOT omit it to let the platform charge a default — the settling action must always carry the
     payment method the user explicitly selected.
 
 RIDES — resolve on the client BEFORE submitting a ride search
