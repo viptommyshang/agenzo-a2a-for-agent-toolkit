@@ -11,9 +11,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -161,33 +162,158 @@ def _norm_actions(actions: Any) -> list[dict[str, Any]]:
     return [na for a in (actions or []) if (na := _norm_action(a)) is not None]
 
 
-def normalize_task(task: dict[str, Any] | None) -> dict[str, Any]:
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool-output slimming: denylist projection + opaque-token handle-ization
+#
+# The orchestrator returns rich cards (hotel prose + dozens of image URLs + every room's image
+# array + policies; flight per-segment baggage tables; and ~800-char opaque `product_token`/`pt_…`
+# blobs). Passed verbatim into the MCP client's context they blow the window in a few turns and the
+# flow gets summarized mid-booking. We slim the *model-facing view only* — the raw payload still
+# goes on the wire to the orchestrator, and is logged verbatim (DEBUG trace) / retrievable via
+# ``inspect()`` — so nothing is lost for driving or auditing.
+#
+# Two invariants keep this safe (see server.py + README):
+#   1. carries-safe: the denylist holds only heavy *content* keys (media/prose/policy tables), never
+#      the id/token keys an action's ``carries`` names — so no field needed to build an ``act``
+#      payload is ever dropped.
+#   2. round-trippable tokens: a long opaque token is replaced by a short handle via ``mint_handle``
+#      (a per-session codec owned by the bridge). ``act`` resolves the handle back to the real token
+#      before sending, so the orchestrator always receives the real value.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Heavy *content* keys dropped from card ``data`` wherever they appear (nested too). Curated to hold
+# only media/prose/policy fields — never an id/token an action ``carries``.
+_DEFAULT_HEAVY_KEYS: frozenset[str] = frozenset(
+    {
+        # hotel.detail / rooms — verbose media & prose the agent never needs to drive the flow
+        "images", "image", "main_image", "appearance_image",
+        "intro", "description", "description_html",
+        "facilities", "comment", "comments",
+        "hotel_certificates", "hotel_text_policies", "hotel_structured_policies",
+        "special_instructions", "tips", "living_room_beds",
+        # flight.offer-list — per-segment baggage tables + verbose per-fare change/refund policy
+        # prose. Each of the 8 offers carries these, so they dominate the offer-list card that the
+        # model reads only to let the user PICK a flight (by price / airline / cabin / times). The
+        # change/refund policy detail is post-selection and is re-fetchable via verify/order-detail,
+        # so dropping it here is safe. NOTE (carries-safe): none of these is an id/token any action
+        # ``carries`` — selection/settlement keys (product_token, price_key*, identifier, order_no,
+        # payment_*) are deliberately NOT listed and stay intact.
+        "baggage_rules",
+        "refund_rules", "change_rules", "refund_original_text", "change_original_text",
+    }
+)
+
+# Only strings this long AND made purely of token/base64 characters (no spaces/`:`, so names,
+# addresses and image URLs are excluded) are treated as opaque tokens. 64 cleanly separates the
+# ~800-char product_token from meaningful short ids (order_id/charge_no/session_id ≈ 20-30 chars).
+_DEFAULT_TOKEN_MIN_LEN = 64
+_TOKEN_CHARSET = re.compile(r"^[A-Za-z0-9_\-=./+]+$")
+
+
+def _looks_opaque(s: str, min_len: int) -> bool:
+    return len(s) >= min_len and _TOKEN_CHARSET.match(s) is not None
+
+
+def _project(
+    value: Any,
+    *,
+    heavy_keys: frozenset[str],
+    mint: Callable[[str], str] | None,
+    token_min_len: int,
+    str_cap: int,
+) -> Any:
+    """Recursively drop heavy keys, handle-ize opaque tokens, and optionally cap long strings."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if k in heavy_keys:
+                continue
+            out[k] = _project(
+                v, heavy_keys=heavy_keys, mint=mint, token_min_len=token_min_len, str_cap=str_cap
+            )
+        return out
+    if isinstance(value, list):
+        return [
+            _project(v, heavy_keys=heavy_keys, mint=mint, token_min_len=token_min_len, str_cap=str_cap)
+            for v in value
+        ]
+    if isinstance(value, str):
+        if mint is not None and _looks_opaque(value, token_min_len):
+            return mint(value)
+        if str_cap and len(value) > str_cap:
+            return value[:str_cap] + "…"
+        return value
+    return value
+
+
+def normalize_task(
+    task: dict[str, Any] | None,
+    *,
+    mint_handle: Callable[[str], str] | None = None,
+    heavy_keys: frozenset[str] | None = None,
+    token_min_len: int = _DEFAULT_TOKEN_MIN_LEN,
+    str_cap: int = 0,
+) -> dict[str, Any]:
     """Turn a Task into a compact, chat-friendly shape: ``{state, text, cards[], primary_component}``.
 
     Card ``actions`` (and list ``item_actions``) keep the full driving contract the orchestrator
     sends — notably ``carries`` (the exact payload fields for that action) and ``scenario`` (a
     scenario-navigation action). This is what lets the agent advance **without** a hardcoded,
     per-domain cheat-sheet: it reads the last card's ``component`` + ``actions[].id`` and copies the
-    ``carries`` fields (or the form's ``data`` fields) into the ``act`` payload."""
+    ``carries`` fields (or the form's ``data`` fields) into the ``act`` payload.
+
+    Card ``data`` is **projected** to keep the MCP client's context small (see the block above):
+      - ``heavy_keys`` (default :data:`_DEFAULT_HEAVY_KEYS`) are dropped wherever they appear. Pass
+        an empty set to disable dropping.
+      - when ``mint_handle`` is given, opaque tokens (≥ ``token_min_len`` token-charset chars) are
+        replaced by short handles both in ``data`` and in the rendered ``text``; the bridge resolves
+        them back before sending an ``act``. Without it, tokens pass through verbatim.
+      - ``str_cap`` (0 = off) truncates any other over-long string as a last-resort backstop.
+    """
     if not isinstance(task, dict):
         return {"state": "", "text": "", "cards": [], "primary_component": None}
+    keys = _DEFAULT_HEAVY_KEYS if heavy_keys is None else heavy_keys
     cards_raw, texts = cards_and_texts(task)
+
+    minted: list[tuple[str, str]] = []
+    mint: Callable[[str], str] | None = None
+    if mint_handle is not None:
+        def mint(real: str) -> str:  # records (real, handle) so we can scrub the text too
+            handle = mint_handle(real)
+            minted.append((real, handle))
+            return handle
+
     cards: list[dict[str, Any]] = []
     for env in cards_raw:
         if not isinstance(env, dict):
             continue
+        data = env.get("data")
+        projected = (
+            _project(data, heavy_keys=keys, mint=mint, token_min_len=token_min_len, str_cap=str_cap)
+            if isinstance(data, (dict, list))
+            else data
+        )
         cards.append(
             {
                 "component": env.get("component"),
                 "kind": env.get("kind"),
-                "data": env.get("data"),
+                "data": projected,
                 "actions": _norm_actions(env.get("actions")),
                 "item_actions": _norm_actions(env.get("item_actions")),
             }
         )
+
+    text = "\n".join(t for t in texts if t)
+    # Keep the rendered text consistent with the projected data: swap any opaque token that also
+    # appears verbatim in the text (e.g. "Product Token: pt_…") for its handle. Longest-first so a
+    # token that is a prefix of another can't partially clobber it.
+    for real, handle in sorted(minted, key=lambda p: len(p[0]), reverse=True):
+        if real:
+            text = text.replace(real, handle)
+
     return {
         "state": task_state(task),
-        "text": "\n".join(t for t in texts if t),
+        "text": text,
         "cards": cards,
         "primary_component": cards[-1]["component"] if cards else None,
     }
