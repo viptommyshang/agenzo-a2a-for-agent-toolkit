@@ -71,6 +71,24 @@ DEBUG_BUFFER = _int("AGENZO_A2A_DEBUG_BUFFER", 50)
 #   large SSE stream can't blow up the MCP payload. 0 disables the cap.
 DEBUG_MAXLEN = _int("AGENZO_A2A_DEBUG_MAXLEN", 20000)
 
+# ── Tool-output slimming (projection + opaque-token handles) ──────────────────
+# The orchestrator returns rich cards (hotel prose + dozens of image URLs + every room's image
+# array + policies; flight per-segment baggage tables; ~800-char opaque product_token/pt_… blobs).
+# Passed verbatim into the MCP client's context they blow the window in a few turns and the booking
+# gets summarized mid-flow. These slim the *model-facing* tool output only — the raw payload still
+# goes on the wire to the orchestrator and is logged verbatim (DEBUG trace) / retrievable via
+# ``inspect()``, so nothing is lost for driving or auditing.
+#
+# PROJECT_TOOL_OUTPUT: master switch. When on, card ``data`` drops heavy content keys and replaces
+#   long opaque tokens with short per-session handles (``act`` resolves them back before sending).
+PROJECT_TOOL_OUTPUT = _bool("AGENZO_A2A_PROJECT_TOOL_OUTPUT", True)
+# TOKEN_HANDLE_MIN_LEN: only token-charset strings at least this long become handles. 64 cleanly
+#   separates the ~800-char product_token from meaningful short ids (order_id/charge_no ≈ 20-30).
+TOKEN_HANDLE_MIN_LEN = _int("AGENZO_A2A_TOKEN_HANDLE_MIN_LEN", 64)
+# TOOL_OUTPUT_STR_CAP: last-resort backstop — truncate any *other* over-long string in card data to
+#   this many chars. 0 = off (rely on the denylist; avoid surprise truncation of a needed field).
+TOOL_OUTPUT_STR_CAP = _int("AGENZO_A2A_TOOL_OUTPUT_STR_CAP", 0)
+
 # Logger shared by the toolkit (the bridge emits request/response traces on it).
 LOGGER_NAME = "agenzo_a2a"
 

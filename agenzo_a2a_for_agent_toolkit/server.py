@@ -84,6 +84,68 @@ _sessions: dict[str, dict[str, str]] = {}
 _runtime_cfg: dict[str, Any] = {}
 
 
+# ── Per-session opaque-token vault (tool-output slimming) ─────────────────────
+# a2a.normalize_task shows the model a short handle (e.g. "@tok1") instead of an ~800-char opaque
+# product_token/pt_… blob. This vault remembers handle → real token per session so ``act`` can swap
+# the handle back to the real value BEFORE it goes on the wire — the orchestrator always receives
+# the real token, and the trace log records the real value, so nothing is lost for driving/auditing.
+class _TokenVault:
+    """Bidirectional short-handle codec for one session's opaque tokens (in-memory, per session)."""
+
+    __slots__ = ("_h2r", "_r2h", "_n")
+
+    def __init__(self) -> None:
+        self._h2r: dict[str, str] = {}
+        self._r2h: dict[str, str] = {}
+        self._n = 0
+
+    def mint(self, real: str) -> str:
+        """Return a stable short handle for ``real`` (same real → same handle within the session)."""
+        handle = self._r2h.get(real)
+        if handle is None:
+            self._n += 1
+            handle = f"@tok{self._n}"
+            self._h2r[handle] = real
+            self._r2h[real] = handle
+        return handle
+
+    def resolve(self, value: str) -> str:
+        """Swap a handle back to its real token; pass through anything that isn't a known handle."""
+        return self._h2r.get(value, value)
+
+
+_token_vaults: dict[str, _TokenVault] = {}
+
+
+def _vault(session_id: str) -> _TokenVault:
+    v = _token_vaults.get(session_id)
+    if v is None:
+        v = _TokenVault()
+        _token_vaults[session_id] = v
+    return v
+
+
+def _walk_resolve(value: Any, vault: _TokenVault) -> Any:
+    if isinstance(value, dict):
+        return {k: _walk_resolve(x, vault) for k, x in value.items()}
+    if isinstance(value, list):
+        return [_walk_resolve(x, vault) for x in value]
+    if isinstance(value, str):
+        return vault.resolve(value)
+    return value
+
+
+def _resolve_handles(session_id: str, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Swap any minted handle in an outgoing ``act`` payload back to its real opaque token.
+
+    No-op when the session minted no handles (vault absent/empty), so a payload that never touched a
+    handle-ized card passes through unchanged."""
+    v = _token_vaults.get(session_id)
+    if not v or not payload:
+        return payload
+    return _walk_resolve(payload, v)
+
+
 def _get_bridge() -> A2ABridge:
     global _bridge
     if _bridge is None:
@@ -144,7 +206,19 @@ def _result(session_id: str, status: int, raw: str) -> dict[str, Any]:
             "cards": [],
             "text": "",
         }
-    out = normalize_task(task)
+    if cfg.PROJECT_TOOL_OUTPUT:
+        # Slim the model-facing view: drop heavy content keys + handle-ize long opaque tokens into
+        # this session's vault (act resolves them back before sending). Raw payload is untouched on
+        # the wire and in the trace log.
+        out = normalize_task(
+            task,
+            mint_handle=_vault(session_id).mint,
+            token_min_len=cfg.TOKEN_HANDLE_MIN_LEN,
+            str_cap=cfg.TOOL_OUTPUT_STR_CAP,
+        )
+    else:
+        # Slimming off: keep the full card data verbatim (original behaviour).
+        out = normalize_task(task, heavy_keys=frozenset())
     out["session_id"] = session_id
     out["member_id"] = _get_bridge().member_id
     return out
@@ -639,6 +713,10 @@ async def act(session_id: str, component: str, action: str, payload: dict[str, A
     Read the action's ``carries`` to know which field name to send."""
     bridge = _get_bridge()
     payload = payload or {}
+    # Swap any short token handle the model copied from a slimmed card back to the real opaque token
+    # before it goes on the wire (no-op if this session minted no handles). Done first so both the
+    # A2A call and the soft-guidance below see the real payment_token_id / product_token.
+    payload = _resolve_handles(session_id, payload) or {}
     try:
         status, raw = await bridge.send_action(_ctx(session_id), component, action, payload)
     except AuthError as exc:
