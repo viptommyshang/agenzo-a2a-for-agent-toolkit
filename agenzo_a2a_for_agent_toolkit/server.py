@@ -829,19 +829,29 @@ async def start_payment(
     Then drive it card-first with ``act(payment_session_id, ...)`` — read each card's ``actions`` /
     ``item_actions`` and follow the generic loop (see ``guide()``); do not assume component names:
       - Pick a listed method with its row action (it ``carries`` the ``id`` + ``payment_brand``).
-        The routing follows the CHOSEN card's brand: an EVO card (Visa/Mastercard) is returned
-        directly as ``payment_method_id`` (no passkey); a UnionPay card mints a network-token via a
-        passkey (open_url → poll to ACTIVE) yielding ``payment_token_id``. Attach whichever the
-        confirm action ``carries`` names.
+        The routing follows the CHOSEN card's ``payment_brand``: a UnionPay card mints a
+        network-token via a passkey (open_url → poll to ACTIVE) yielding ``payment_token_id``;
+        **any other brand** (``evo`` for Mastercard-and-friends, ``visa`` for a VTS-bound Visa) is
+        returned directly as ``payment_method_id`` (no passkey) for the host order to settle
+        server-side. Attach whichever the confirm action ``carries`` names.
       - If selecting a method returns a card with an ``open_url`` action (passkey / enrollment /
-        Drop-in), call ``open_url`` on the URL at that card's ``data`` field, have the user finish,
+        card entry), call ``open_url`` on the URL at that card's ``data`` field, have the user finish,
         send the action's ``callback`` id, then ``poll(session_id, component)`` until
         ``data.status == "ACTIVE"``. Use the resulting credential in the booking confirm.
       - NO method listed / want a NEW card: use the picker's scenario-jump action (``add-method``)
-        to bind one, then submit the add-method form. That form REQUIRES ``user_email`` and takes an
-        optional ``brand`` that CHOOSES the card type: ``brand:"evo"`` binds a Visa/Mastercard (EVO
-        Drop-in), any other/absent value binds a UnionPay card. So to add a Mastercard, submit
-        ``{"user_email": "...", "brand": "evo"}`` — omitting ``brand`` defaults to UnionPay.
+        to bind one, then submit the add-method form. That form REQUIRES ``user_email``; the optional
+        ``brand`` only chooses **which rail**, NOT the card brand:
+          · ``brand:"unionpay"`` → UnionPay Agent Pay enrollment (its own ``enroll_url``).
+          · **omitted** (or ``"card"`` / anything that is not ``unionpay``) → the ONE platform-hosted
+            **unified card-entry page**. Submit ``{"user_email": "..."}`` and open the returned
+            ``link_url``: the cardholder types the card there and **the page itself routes by the
+            card's BIN** — Visa (4…) runs the native VTS + Payment Passkey rail, any other brand
+            (Mastercard, …) runs EVO. So you do NOT need to know the brand up front, and there is
+            nothing to pass for "Visa" vs "Mastercard".
+        ⚠️ Omitting ``brand`` does **NOT** default to UnionPay — it goes to the unified card page.
+        To bind a UnionPay card you MUST pass ``brand:"unionpay"`` explicitly. (Legacy note: the old
+        ``brand:"evo"`` value still lands on the unified card page, since the gate is simply
+        "is it unionpay or not", but it is obsolete — don't emit it.)
 
     Drive this session with STRUCTURED ``act(...)`` calls ONLY — do not send natural-language
     ``send_message`` here (free text in a payment sub-flow gets misrouted). Reuse THIS session for
@@ -991,10 +1001,11 @@ async def start_token_creation(
 def open_url(url: str) -> dict[str, Any]:
     """Open a URL in the local default browser — used for the out-of-band pages of any card whose
     action has ``dispatch:"client"`` + ``capability:"open_url"``: UnionPay checkout (passkey),
-    UnionPay card-enrollment (enroll_url), and the EVO (Visa/Mastercard) Drop-in card-binding page
-    (dropin_url, hosted by the orchestrator). The MCP server runs on the user's machine, so this
-    pops the page for the user to complete the passkey/enrollment/card entry. After they finish,
-    drive the next card (e.g. "paid" then "poll", or "bound" then "poll").
+    UnionPay card-enrollment (``enroll_url``), and the **unified card-entry page** (``link_url``,
+    hosted by the platform) where the cardholder types any Visa/Mastercard and the page routes by
+    the card's BIN (Visa → VTS + Payment Passkey; other brands → EVO). The MCP server runs on the
+    user's machine, so this pops the page for the user to complete the passkey/enrollment/card
+    entry. After they finish, drive the next card (e.g. "paid" then "poll", or "bound" then "poll").
 
     When deployed remotely (SSE transport), the browser can't be opened on the server, so the URL is
     returned for the client/user to open instead."""
@@ -1161,11 +1172,12 @@ PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (ow
       – IF THE PICKER IS EMPTY (no cards): you MUST ask the user to add one before going further —
         there is no valid "just charge the default" path. Ask whether they want a UnionPay card or a
         Visa/Mastercard, then send `add-method` and submit its form (REQUIRES `user_email`; `brand`
-        CHOOSES the type: `brand:"evo"` → Visa/Mastercard EVO Drop-in; omitted/other → UnionPay).
-        Never pick the brand for the user.
-  • Routing follows the card the USER picked in the start_payment picker: an EVO card is returned
-    directly as payment_method_id; a UnionPay card mints a token via a passkey (open_url → poll to
-    ACTIVE) → payment_token_id.
+        picks the RAIL, not the card brand: `unionpay` → UPI enrollment; omitted → the unified
+        card-entry page, which detects Visa vs Mastercard from the BIN itself). Omitting `brand`
+        does NOT mean UnionPay — pass `unionpay` explicitly for that. Never pick the rail for the user.
+  • Routing follows the card the USER picked in the start_payment picker, by its payment_brand:
+    a UnionPay card mints a token via a passkey (open_url → poll to ACTIVE) → payment_token_id;
+    any other brand (evo / visa) is returned directly as payment_method_id.
   • STANDALONE TOKEN CREATION shares the same minting: the ``create-token`` scenario (start it with
     book("create a network token …")) mints a reusable network token on ALL THREE rails — UnionPay
     (passkey), Visa (FIDO passkey), and EVO/Mastercard (synchronous, no browser); start_token_creation
