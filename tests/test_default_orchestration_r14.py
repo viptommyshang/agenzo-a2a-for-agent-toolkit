@@ -1,17 +1,17 @@
 """任务 11.6（bridge 层）：R14「MCP 桥默认编排令牌现结主路径（软引导）」示例/集成测试。
 
 被测对象：``agenzo_a2a_for_agent_toolkit.server`` 的 MCP 桥软引导（方案 A）——即 ``act`` /
-``start_token_creation`` / ``guide`` 在货币结算动作与铸令牌子流程上承接的默认编排三段式主路径。
+``start_token_creation`` / ``guide`` 在货币结算动作与创建网络令牌子流程上承接的默认编排三段式主路径。
 
 本文件聚焦 **R14 的默认编排三段式主路径「顺序 + 不变量」** 以及 ``guide()`` 文案：
-  - R14.1 未显式选 EVO 时，默认编排三段式主路径——**顺序**：锁单（create-order）→ 铸令牌
+  - R14.1 未显式选 EVO 时，默认编排三段式主路径——**顺序**：锁单（create-order）→ 创建网络令牌
     （独立 Payment_Session）→ 以 ``payment_token_id`` 直扣；**不变量**：令牌 ``external_transaction_id``
     == order_id、令牌权威金额 == 订单权威金额（Order_Authoritative_Amount）、两会话使用同一 member_id。
-  - R14.2 显式提供 ``payment_method_id`` → 走 EVO、**不铸令牌**（以「默认↔显式」决策边界的角度断言，
-    并守卫 EVO 分流不叠加铸令牌软引导）。
+  - R14.2 显式提供 ``payment_method_id`` → 走 EVO、**不创建网络令牌**（以「默认↔显式」决策边界的角度断言，
+    并守卫 EVO 分流不叠加创建网络令牌软引导）。
   - R14.3 令牌主路径失败 → 返回可回退 EVO 引导，且**绝不静默改用 member/平台/开发者默认卡**（以
     「失败短路成功态软引导 + 禁默认卡」的角度断言）。
-  - R14.4 / R12.3 ``guide()`` 把默认编排顺序表述为规范主路径，并含三条约束文案（先锁单后铸令牌、
+  - R14.4 / R12.3 ``guide()`` 把默认编排顺序表述为规范主路径，并含三条约束文案（先锁单后创建网络令牌、
     两会话同 member、strict 订单绑定）。
 
 > 与任务 11.7（``tests/test_evo_narrowing_r9.py``）的**去重边界**：
@@ -19,10 +19,10 @@
 >     ``evo_orchestration`` / ``token_path_failure``）在各单点 ``act`` / ``start_token_creation``
 >     调用下的**出现/缺席**与失败**环节标签**（LOCKING / MINTING / DIRECT CHARGE）及回退文案。
 >   - 本文件（11.6）**不**逐条复述那些分支/环节标签断言，而是补齐 11.7 不覆盖的维度：
->       ① **端到端三段式集成**——用统一事件时间线断言「锁单 → 铸令牌 → 直扣」的**跨会话先后顺序**，
+>       ① **端到端三段式集成**——用统一事件时间线断言「锁单 → 创建网络令牌 → 直扣」的**跨会话先后顺序**，
 >          且三段式的四条不变量（顺序、``external_transaction_id`` == order_id、金额相等、同 member）；
 >       ② **默认↔显式 EVO 的决策边界**（同一结算动作，payload 有/无 ``payment_method_id`` → 软引导键
->          互斥翻转，且仅默认分支叠加三段式铸令牌 nudge）；
+>          互斥翻转，且仅默认分支叠加三段式创建网络令牌 nudge）；
 >       ③ **失败短路**——失败态优先，短路掉成功态软引导（``payment_warning`` 等）且禁默认卡；
 >       ④ **``guide()`` 文案**（11.7 完全未触及 ``guide()``）。
 
@@ -96,15 +96,15 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
 
     # ── R14.1：默认编排三段式主路径的「顺序 + 四条不变量」端到端集成 ─────────────────────────
     async def test_three_stage_main_path_order_and_invariants(self) -> None:
-        """完整走一遍默认主路径：锁单（book/create-order）→ 铸令牌（独立会话）→ 以 payment_token_id
+        """完整走一遍默认主路径：锁单（book/create-order）→ 创建网络令牌（独立会话）→ 以 payment_token_id
         直扣，断言 R14.1 的四条不变量与三段式**先后顺序**。
 
         断言：
-          - 顺序：锁单（Booking_Session 首个交互）< 铸令牌（payment.token-setup#submit）< 直扣
+          - 顺序：锁单（Booking_Session 首个交互）< 创建网络令牌（payment.token-setup#submit）< 直扣
             （携 payment_token_id 的 pay 动作）；
           - 令牌 external_transaction_id == order_id；
           - 令牌权威金额（amount_cents，最小币种单位）== 订单权威金额（amount_minor）；
-          - 两会话使用同一 member_id，且铸令牌在与 Booking_Session 隔离的独立 Payment_Session 内进行；
+          - 两会话使用同一 member_id，且创建网络令牌在与 Booking_Session 隔离的独立 Payment_Session 内进行；
           - 最终直扣（stage 3，携 payment_token_id）成功时不叠加任何成功态软引导。
 
         Validates: Requirements 14.1, 6.2, 6.3
@@ -125,12 +125,12 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(got_order_id, order_id)
         self.assertEqual(got_authoritative_minor, authoritative_minor)
 
-        # ② 铸令牌：以订单权威金额 + order_id，在独立 payment 会话中铸造。
+        # ② 创建网络令牌：以订单权威金额 + order_id，在独立 payment 会话中创建。
         token = await server.start_token_creation(
             amount_cents=got_authoritative_minor, order_id=got_order_id, member_id=member
         )
         token_sid = token["session_id"]
-        # 铸令牌成功（非失败态）→ 不挂令牌路径失败引导。
+        # 创建网络令牌成功（非失败态）→ 不挂令牌路径失败引导。
         self.assertNotIn("token_path_failure", token)
 
         # 会话隔离 + 同 member（两会话归属一致，且各自独立 A2A context）。
@@ -141,7 +141,7 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(token["member_id"], member)
         self.assertEqual(self.fake.set_member_calls, [member, member])
 
-        # 铸令牌入口卡提交 payload 的两条不变量：金额相等 + external_transaction_id == order_id。
+        # 创建网络令牌入口卡提交 payload 的两条不变量：金额相等 + external_transaction_id == order_id。
         submits = [
             a for a in self.fake.action_calls
             if a[0] == token_sid and a[1] == "payment.token-setup" and a[2] == "submit"
@@ -151,7 +151,7 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mint_payload["amount_cents"], authoritative_minor)
         self.assertEqual(mint_payload["external_transaction_id"], order_id)
 
-        # ③ 直扣：回 Booking_Session，pay 动作携铸得的 payment_token_id（stage 3）。
+        # ③ 直扣：回 Booking_Session，pay 动作携创建得到的 payment_token_id（stage 3）。
         self.fake.queue_action_response(200, _task_json(state="completed"))
         minted_token_id = "ptk_r14_main"
         charge = await server.act(
@@ -163,7 +163,7 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("evo_orchestration", charge)
         self.assertNotIn("payment_warning", charge)
 
-        # ── 三段式顺序守卫（统一事件时间线）：锁单 < 铸令牌 < 直扣 ──────────────────────────
+        # ── 三段式顺序守卫（统一事件时间线）：锁单 < 创建网络令牌 < 直扣 ──────────────────────────
         lock_idx = next(
             i for i, e in enumerate(self.fake.events) if e[1] == booking_sid  # Booking 首个交互=锁单
         )
@@ -175,8 +175,8 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
             i for i, e in enumerate(self.fake.events)
             if e[0] == "action" and e[1] == booking_sid and e[2] == f"{_HOTEL_PAY[0]}#{_HOTEL_PAY[1]}"
         )
-        self.assertLess(lock_idx, mint_idx, "锁单必须发生在铸令牌之前")
-        self.assertLess(mint_idx, charge_idx, "铸令牌必须发生在直扣之前")
+        self.assertLess(lock_idx, mint_idx, "锁单必须发生在创建网络令牌之前")
+        self.assertLess(mint_idx, charge_idx, "创建网络令牌必须发生在直扣之前")
         # 直扣事件确实携带 payment_token_id（走令牌直扣分支，而非 payment_method_id）。
         charge_event_payload = self.fake.events[charge_idx][3] or {}
         self.assertEqual(charge_event_payload.get("payment_token_id"), minted_token_id)
@@ -215,9 +215,9 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         """同一 hotel 锁后付结算动作，边界由 **evo_explicit** 划定（而非仅凭 payment_method_id）：
         (a) payload 无凭据 → 默认三段式令牌主路径（default_orchestration + payment_warning）；
         (b) payload 带 payment_method_id 但**未** evo_explicit（选了已绑卡）→ 仍走默认令牌主路径
-        （default_orchestration，用该卡铸令牌；已选卡故不挂 payment_warning）；
+        （default_orchestration，用该卡创建网络令牌；已选卡故不挂 payment_warning）；
         (c) payload 显式 evo_explicit=true（用户明确选直刷 EVO）→ 翻转到显式 EVO 分流
-        （evo_orchestration、不铸令牌）。三者软引导键互斥。
+        （evo_orchestration、不创建网络令牌）。三者软引导键互斥。
 
         Validates: Requirements 14.2, 14.1
         """
@@ -229,7 +229,7 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         self.assertIn("payment_warning", default_out)
         self.assertNotIn("evo_orchestration", default_out)
 
-        # (b) 带已绑卡 payment_method_id 但未显式选 EVO → 仍默认令牌主路径（用该卡铸令牌），
+        # (b) 带已绑卡 payment_method_id 但未显式选 EVO → 仍默认令牌主路径（用该卡创建网络令牌），
         #     evo_orchestration 缺席；已选卡故不再挂未选卡警告。
         bound_out = await server.act(
             sid, _HOTEL_PAY[0], _HOTEL_PAY[1], {"payment_method_id": "pm_evo_boundary"}
@@ -238,7 +238,7 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("evo_orchestration", bound_out)
         self.assertNotIn("payment_warning", bound_out)
 
-        # (c) 显式 evo_explicit=true → 翻转到 EVO 兜底轨、不铸令牌；不叠加令牌主路径 nudge / 未选卡警告。
+        # (c) 显式 evo_explicit=true → 翻转到 EVO 兜底轨、不创建网络令牌；不叠加令牌主路径 nudge / 未选卡警告。
         evo_out = await server.act(
             sid,
             _HOTEL_PAY[0],
@@ -249,12 +249,12 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("default_orchestration", evo_out)
         self.assertNotIn("token_path_failure", evo_out)
         self.assertNotIn("payment_warning", evo_out)
-        # 「不铸令牌」不变量：显式 EVO 结算动作全程未触发任何铸令牌子流程（无 payment.token-setup#submit）。
+        # 「不创建网络令牌」不变量：显式 EVO 结算动作全程未触发任何创建网络令牌子流程（无 payment.token-setup#submit）。
         mint_actions = [
             a for a in self.fake.action_calls
             if a[1] == "payment.token-setup" and a[2] == "submit"
         ]
-        self.assertEqual(mint_actions, [], "显式 EVO 分流不得铸造 Network_Token")
+        self.assertEqual(mint_actions, [], "显式 EVO 分流不得创建 Network_Token")
 
     # ── R14.3：令牌主路径失败 → 失败短路成功态软引导，且绝不静默改用默认卡 ──────────────────────
     async def test_main_path_failure_short_circuits_success_advice_and_forbids_default_card(
@@ -292,8 +292,8 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
 
     # ── R14.4 / R12.3：guide() 把默认编排顺序表述为规范主路径，并含三条约束文案 ─────────────────
     async def test_guide_states_default_main_path_and_three_constraints(self) -> None:
-        """``guide()`` 文案把「锁单 → 独立会话铸令牌 → 回会话直扣」表述为默认/规范主路径，并包含
-        R12.3 三条约束（三条均须出现）：①先锁单后铸令牌；②两会话同 member；③strict 订单绑定；同时
+        """``guide()`` 文案把「锁单 → 独立会话创建网络令牌 → 回会话直扣」表述为默认/规范主路径，并包含
+        R12.3 三条约束（三条均须出现）：①先锁单后创建网络令牌；②两会话同 member；③strict 订单绑定；同时
         保留「不得静默回退平台/开发者/会员默认卡」的既有强约束。
 
         （11.7 完全不触及 ``guide()``，本用例为 11.6 独有维度。）
@@ -312,7 +312,7 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         self.assertIn("EVO preauth+capture is NOT the default", text)
 
         # 三条约束（R12.3 / R14.4）——三条均须出现。
-        self.assertIn("LOCK FIRST, MINT SECOND", text)              # ① 先锁单后铸令牌
+        self.assertIn("LOCK FIRST, MINT SECOND", text)              # ① 先锁单后创建网络令牌
         self.assertIn("SAME member_id ACROSS BOTH SESSIONS", text)  # ② 两会话同 member
         self.assertIn("STRICT ORDER BINDING", text)                 # ③ strict 订单绑定
         self.assertIn("external_transaction_id", text)              # strict 绑定的落地字段

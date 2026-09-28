@@ -320,7 +320,7 @@ class VaultRoundTripTest(unittest.IsolatedAsyncioTestCase):
         cfg.PROJECT_TOOL_OUTPUT = self._orig_flag
 
     async def test_handle_minted_then_resolved_to_real_token_on_act(self) -> None:
-        # book 的响应里带 offer-list 卡（含长 product_token）→ normalize 铸句柄 @tok1
+        # book 的响应里带 offer-list 卡（含长 product_token）→ normalize 创建句柄 @tok1
         self.fake.queue_text_response(200, _rpc(_task(cards=[_offer_card()])))
         booking = await server.book("book a flight from Shanghai to Beijing")
         sid = booking["session_id"]
@@ -334,7 +334,7 @@ class VaultRoundTripTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["product_token"], LONG_TOKEN)  # 编排器收到真实 token
 
     async def test_unknown_or_absent_handle_passes_through(self) -> None:
-        # 未铸任何句柄的会话：payload 原样透传，不误伤
+        # 未创建任何句柄的会话：payload 原样透传，不误伤
         booking = await server.book("book a flight")
         sid = booking["session_id"]
         await server.act(sid, "flight.offer-list", "select", {"product_token": "pt_plain_value"})
