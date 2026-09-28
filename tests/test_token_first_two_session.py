@@ -1,14 +1,14 @@
-"""任务 7.4：MCP 桥「两会话 / 同 member / 先锁单后铸令牌」示例测试。
+"""任务 7.4：MCP 桥「两会话 / 同 member / 先锁单后创建网络令牌」示例测试。
 
 被测对象：``agenzo_a2a_for_agent_toolkit.server`` 的 ``book`` 与 ``start_token_creation`` 两个 MCP
 工具，以及它们对 A2A bridge 的调用契约。
 
 覆盖需求：
-  - R5.1 铸令牌走独立于 Booking_Session 的 Payment_Session（``_new_session("payment")``，context 隔离）。
+  - R5.1 创建网络令牌走独立于 Booking_Session 的 Payment_Session（``_new_session("payment")``，context 隔离）。
   - R5.2 Payment_Session 与其 Booking_Session 使用相同的 member_id（传入 → ``set_member`` 同值调用）。
-  - R5.3 铸令牌子流程仅用结构化卡片动作推进（``send_action`` 提交 ``payment.token-setup#submit``），
+  - R5.3 创建网络令牌子流程仅用结构化卡片动作推进（``send_action`` 提交 ``payment.token-setup#submit``），
          不发自由文本 ``send_message``（唯一固定分类种子 "Create a network token." 除外）。
-  - R6.1/R6.2/R6.3 集成示例：先锁单取得 order_id 与权威金额，再以该金额 + order_id 铸令牌；
+  - R6.1/R6.2/R6.3 集成示例：先锁单取得 order_id 与权威金额，再以该金额 + order_id 创建网络令牌；
          提交 payload 的 ``amount_cents`` == 订单权威金额、``external_transaction_id`` == order_id。
 
 设计参照：design.md 第 8 节（MCP_Bridge）与 requirements R5/R6。
@@ -117,7 +117,7 @@ class TokenFirstTwoSessionTest(unittest.IsolatedAsyncioTestCase):
         server._sessions.clear()
         server._sessions.update(self._orig_sessions)
 
-    # ── R5.1：铸令牌开独立 payment 会话，与 booking 会话 context 隔离 ────────────────
+    # ── R5.1：创建网络令牌开独立 payment 会话，与 booking 会话 context 隔离 ────────────────
     async def test_mint_opens_independent_payment_session(self) -> None:
         booking = await server.book("book a hotel near the Bund", member_id="m-shared")
         booking_sid = booking["session_id"]
@@ -155,7 +155,7 @@ class TokenFirstTwoSessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(booking["member_id"], "m-shared")
         self.assertEqual(token["member_id"], "m-shared")
 
-    # ── R5.3：铸令牌子流程仅用结构化动作，不发自由文本（固定分类种子除外）───────────────
+    # ── R5.3：创建网络令牌子流程仅用结构化动作，不发自由文本（固定分类种子除外）───────────────
     async def test_mint_uses_structured_actions_only(self) -> None:
         token = await server.start_token_creation(
             amount_cents=42800, order_id="hho_ACT1", member_id="m-shared"
@@ -168,11 +168,11 @@ class TokenFirstTwoSessionTest(unittest.IsolatedAsyncioTestCase):
         # payment 会话内唯一的自由文本就是固定分类种子，别无其他 send_message。
         self.assertEqual(len(text_calls), 1)
         self.assertEqual(text_calls[0][1], "Create a network token.")
-        # 推进铸令牌用的是结构化卡片动作 payment.token-setup#submit。
+        # 推进创建网络令牌用的是结构化卡片动作 payment.token-setup#submit。
         submits = [a for a in action_calls if a[1] == "payment.token-setup" and a[2] == "submit"]
         self.assertEqual(len(submits), 1)
 
-    # ── R6.1/R6.2/R6.3：集成示例——先锁单取得 order_id 与权威金额，再铸令牌并绑定 ─────────
+    # ── R6.1/R6.2/R6.3：集成示例——先锁单取得 order_id 与权威金额，再创建网络令牌并绑定 ─────────
     async def test_lock_first_then_mint_binds_amount_and_order(self) -> None:
         order_id = "hho_TESTORDER123"
         authoritative_minor = 42800  # 订单权威金额（最小币种单位）
@@ -188,14 +188,14 @@ class TokenFirstTwoSessionTest(unittest.IsolatedAsyncioTestCase):
         )
         booking_sid = booking["session_id"]
 
-        # 从锁单返回的卡片读取权威 order_id 与权威金额（客户端据此驱动后续铸令牌）。
+        # 从锁单返回的卡片读取权威 order_id 与权威金额（客户端据此驱动后续创建网络令牌）。
         order_card = booking["cards"][-1]
         got_order_id = order_card["data"]["order_id"]
         got_authoritative_minor = order_card["data"]["amount_minor"]
         self.assertEqual(got_order_id, order_id)
         self.assertEqual(got_authoritative_minor, authoritative_minor)
 
-        # ② 再铸令牌：以订单权威金额 + order_id，在独立 payment 会话中铸造。
+        # ② 再创建网络令牌：以订单权威金额 + order_id，在独立 payment 会话中创建。
         token = await server.start_token_creation(
             amount_cents=got_authoritative_minor,
             order_id=got_order_id,
@@ -218,7 +218,7 @@ class TokenFirstTwoSessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["amount_cents"], authoritative_minor)
         self.assertEqual(payload["external_transaction_id"], order_id)
 
-    # ── 补充守卫：无 order_id 的独立铸令牌不带 external_transaction_id ─────────────────
+    # ── 补充守卫：无 order_id 的独立创建网络令牌不带 external_transaction_id ─────────────────
     async def test_orderless_mint_omits_binding(self) -> None:
         token = await server.start_token_creation(amount_cents=1000, member_id="m-shared")
         token_sid = token["session_id"]

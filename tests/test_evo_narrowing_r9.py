@@ -1,15 +1,15 @@
 """任务 11.7（bridge 层）：R9「EVO 预授权兜底轨收窄为显式/回退」回归测试。
 
 被测对象：``agenzo_a2a_for_agent_toolkit.server`` 的 MCP 桥软引导（方案 A）——即 ``act`` /
-``start_token_creation`` 在货币结算动作 / 铸令牌子流程上附挂的三分支非阻塞引导：
+``start_token_creation`` 在货币结算动作 / 创建网络令牌子流程上附挂的三分支非阻塞引导：
   - ``default_orchestration``：未显式选 EVO 卡时，默认编排「独立 Network_Token 现结」三段式主路径。
-  - ``evo_orchestration``：显式携带 ``payment_method_id``（EVO 卡）时，走 EVO 兜底轨、不铸令牌。
-  - ``token_path_failure``：令牌主路径（锁单/铸令牌/直扣）任一环节失败时，返回「可显式回退 EVO、
+  - ``evo_orchestration``：显式携带 ``payment_method_id``（EVO 卡）时，走 EVO 兜底轨、不创建网络令牌。
+  - ``token_path_failure``：令牌主路径（锁单/创建网络令牌/直扣）任一环节失败时，返回「可显式回退 EVO、
     绝不静默改用默认卡」的引导。
 
 本文件聚焦 R9 的**「收窄」语义**（与任务 3.5 的「月结/EVO 兜底存在性」回归去重）：
   - R9.4 未显式指定支付方式 → 默认**不走 EVO**（走令牌现结主路径）；
-  - R9.1 显式提供有效 ``payment_method_id`` → 明确走 EVO 兜底轨（Payment_Gate 预授权+捕获），不铸令牌；
+  - R9.1 显式提供有效 ``payment_method_id`` → 明确走 EVO 兜底轨（Payment_Gate 预授权+捕获），不创建网络令牌；
   - R9.2 令牌路径失败 → 返回**可回退 EVO** 的引导（回退是客户端显式决定，桥层不静默改卡）。
 
 > 层次边界（与设计 Testing Strategy「EVO 收窄（R9）」一致）：R9.5/R9.6（EVO 预授权/捕获失败、
@@ -102,10 +102,10 @@ class R9NarrowingBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("evo_orchestration", out)
         self.assertNotIn("token_path_failure", out)
 
-    # ── R9.1：显式提供有效 payment_method_id → 走 EVO 兜底轨、不铸令牌 ────────────────────
+    # ── R9.1：显式提供有效 payment_method_id → 走 EVO 兜底轨、不创建网络令牌 ────────────────────
     async def test_explicit_evo_optin_routes_to_evo_without_mint(self) -> None:
         """结算动作**显式声明 evo_explicit=true**（用户明确选择直刷 EVO 卡而非网络令牌）→ 明确走 EVO
-        预授权+捕获兜底轨、**不铸造** Network_Token；不再叠加默认令牌主路径引导。
+        预授权+捕获兜底轨、**不创建** Network_Token；不再叠加默认令牌主路径引导。
 
         Validates: Requirements 9.1
         """
@@ -129,7 +129,7 @@ class R9NarrowingBridgeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_bound_card_without_optin_defaults_to_token_mint(self) -> None:
         """结算动作带 payment_method_id（选了已绑卡）但**未**声明 evo_explicit → 默认令牌主路径
-        （用该卡铸令牌再直扣），而非 EVO 直扣。已有卡不是跳过铸令牌的理由。
+        （用该卡创建网络令牌再直扣），而非 EVO 直扣。已有卡不是跳过创建网络令牌的理由。
 
         Validates: Requirements 9.1, 14.1
         """
@@ -143,7 +143,7 @@ class R9NarrowingBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("evo_orchestration", out)
         self.assertNotIn("token_path_failure", out)
         advice = out["default_orchestration"]
-        # 建议里明确「已有卡也先用该卡铸令牌」。
+        # 建议里明确「已有卡也先用该卡创建网络令牌」。
         self.assertIn("start_token_creation", advice)
         self.assertIn("EXISTING CARD", advice)
         # 已带 payment_method_id（选了卡）→ 不再挂「未选卡」默认卡警告。
@@ -165,7 +165,7 @@ class R9NarrowingBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("evo_orchestration", out)
         self.assertNotIn("default_orchestration", out)
 
-    # ── R9.2：令牌路径失败 → 返回可回退 EVO 引导（锁单 / 铸令牌 / 直扣三环节）──────────────
+    # ── R9.2：令牌路径失败 → 返回可回退 EVO 引导（锁单 / 创建网络令牌 / 直扣三环节）──────────────
     async def test_lock_failure_yields_fallback_evo_guidance(self) -> None:
         """令牌主路径**锁单**环节失败（结算动作返回 failed 终态、未携任何显式凭据）→ 返回定位到
         LOCKING 环节的回退引导：可显式回退 EVO、绝不静默改用默认卡。
@@ -186,12 +186,12 @@ class R9NarrowingBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("evo_orchestration", out)
 
     async def test_mint_failure_yields_fallback_evo_guidance(self) -> None:
-        """令牌主路径**铸令牌**环节失败（独立 Payment_Session 的 token-setup#submit 返回 failed）→
+        """令牌主路径**创建网络令牌**环节失败（独立 Payment_Session 的 token-setup#submit 返回 failed）→
         返回定位到 MINTING 环节的回退引导。
 
         Validates: Requirements 9.2
         """
-        # 铸令牌提交返回失败终态（分类种子 send_text 用默认成功响应）。
+        # 创建网络令牌提交返回失败终态（分类种子 send_text 用默认成功响应）。
         self.fake.queue_action_response(200, _task_json(state="failed"))
         out = await server.start_token_creation(
             amount_cents=42800, order_id="hho_R9FAIL", member_id="m-r9"
@@ -220,7 +220,7 @@ class R9NarrowingBridgeTest(unittest.IsolatedAsyncioTestCase):
         self._assert_fallback_semantics(advice)
 
     async def test_transport_failure_on_mint_yields_fallback_guidance(self) -> None:
-        """铸令牌分类种子即传输失败（HTTP 非 200）→ 同样返回可回退 EVO 的引导（覆盖 error 键分支）。
+        """创建网络令牌分类种子即传输失败（HTTP 非 200）→ 同样返回可回退 EVO 的引导（覆盖 error 键分支）。
 
         Validates: Requirements 9.2
         """
