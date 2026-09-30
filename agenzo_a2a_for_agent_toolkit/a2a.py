@@ -147,7 +147,31 @@ def task_state(task: dict[str, Any]) -> str:
 # drive **generically** (no hardcoded per-domain cheat-sheet): the payload for an action is exactly
 # the fields named in ``carries``; ``scenario`` means the action navigates to another scenario;
 # ``capability``/``data_ref``/``callback`` describe out-of-band steps (e.g. open_url → callback).
-_ACTION_KEYS = ("id", "dispatch", "carries", "scenario", "capability", "data_ref", "callback", "refresh")
+#
+# ``role``/``component``/``payload``/``confirm_of``/``retry_of`` matter for the orchestrator's two
+# **base-level** cards (``confirmation`` and ``error``). Their single action does NOT belong to the
+# card it arrives on — it points back at the action that was just blocked or that just failed, on
+# ANOTHER component. Dropping ``component`` left the agent with an action id and no idea where to
+# send it (the card's own ``component`` is ``confirmation``, which has no such action); dropping
+# ``payload`` lost the only machine-readable statement of what to add when re-sending (for the
+# confirmation card that is ``{"confirm": true}`` — and the orchestrator only reads confirmation
+# from the payload, never from the action's top level). ``confirm_of``/``retry_of`` mark the action
+# as a RE-SEND rather than a new step; ``role`` tells confirm/retry apart from an ordinary action.
+_ACTION_KEYS = (
+    "id",
+    "dispatch",
+    "carries",
+    "scenario",
+    "capability",
+    "data_ref",
+    "callback",
+    "refresh",
+    "role",
+    "component",
+    "payload",
+    "confirm_of",
+    "retry_of",
+)
 
 
 def _norm_action(a: Any) -> dict[str, Any] | None:
