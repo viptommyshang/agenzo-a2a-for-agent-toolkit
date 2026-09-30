@@ -109,6 +109,56 @@ def _hotel_detail_card() -> dict[str, Any]:
     }
 
 
+def _confirmation_card() -> dict[str, Any]:
+    """基座级确认卡:资金写在等显式确认。其唯一动作**指回被拦下的那张卡**,不是本卡。"""
+    return {
+        "component": "confirmation",
+        "kind": "confirm",
+        "data": {
+            "confirmed": False,
+            "write_status": "need_confirmation",
+            "summary": {"order-no": "ffo_01M3RR76GYWDCAH4ZS7V567X9K"},
+            "message": 'Re-send the SAME action with "confirm": true added to its payload.',
+            "write_id": "cancel-order",
+        },
+        "actions": [
+            {
+                "role": "confirm",
+                "id": "cancel-order",
+                "component": "flight.order-detail",
+                "dispatch": "agent",
+                "confirm_of": "flight.order-detail#cancel-order",
+                "payload": {"confirm": True},
+            }
+        ],
+    }
+
+
+def _error_card() -> dict[str, Any]:
+    """基座级错误卡:可恢复时带出「改正入参后重发刚失败的那个动作」,坐标同样指向别的卡。"""
+    return {
+        "component": "error",
+        "kind": "error",
+        "data": {
+            "code": "1001",
+            "name": "INVALID_REQUEST",
+            "http_status": 400,
+            "recoverable": True,
+            "write_status": "missing_args",
+            "message": "Missing required fields.",
+        },
+        "actions": [
+            {
+                "role": "retry",
+                "id": "confirm",
+                "component": "flight.booking-confirm",
+                "dispatch": "agent",
+                "retry_of": "flight.booking-confirm#confirm",
+            }
+        ],
+    }
+
+
 def _confirm_card() -> dict[str, Any]:
     """flight.booking-confirm：confirm 动作零 carries(token 在服务端);data.productToken 纯展示。"""
     return {
@@ -257,6 +307,44 @@ class ProjectionTest(unittest.TestCase):
         confirm = card["actions"][0]
         self.assertEqual(confirm["id"], "confirm")
         self.assertNotIn("carries", confirm)  # 零 carries：服务端持有 token
+
+    def test_confirmation_card_action_keeps_its_re_send_coordinates(self) -> None:
+        """确认卡的动作**指回另一张卡** —— ``component`` 与 ``payload`` 一个都不能丢。
+
+        这张卡的 ``component`` 是 ``confirmation``，而它唯一的动作要发往**被拦下的那张卡**
+        （这里是 ``flight.order-detail``）。投影若把 ``component`` 削掉，调用方就只剩一个动作 id、
+        不知道往哪发；削掉 ``payload`` 则丢掉「重发时要补什么」的唯一机器可读说明 —— 编排器只从
+        payload 读确认，动作顶层带确认到不了写引擎。两者缺一，确认停顿就又成了死胡同。
+        """
+        out = normalize_task(_task(cards=[_confirmation_card()]))
+        card = out["cards"][0]
+        self.assertEqual(card["component"], "confirmation")
+        self.assertEqual(card["kind"], "confirm")
+        # 停顿语义与待确认摘要照常透出（都是短值，不受句柄化与重字段丢弃影响）。
+        self.assertIs(card["data"]["confirmed"], False)
+        self.assertEqual(card["data"]["write_status"], "need_confirmation")
+        self.assertEqual(card["data"]["summary"], {"order-no": "ffo_01M3RR76GYWDCAH4ZS7V567X9K"})
+
+        (action,) = card["actions"]
+        self.assertEqual(action["id"], "cancel-order")
+        self.assertEqual(action["component"], "flight.order-detail")  # 发往这张卡，不是 confirmation
+        self.assertEqual(action["payload"], {"confirm": True})        # 重发时要合并的补丁
+        self.assertEqual(action["confirm_of"], "flight.order-detail#cancel-order")
+        self.assertEqual(action["role"], "confirm")
+        self.assertEqual(action["dispatch"], "agent")
+
+    def test_error_card_retry_action_keeps_its_re_send_coordinates(self) -> None:
+        """错误卡的 retry 动作同理:它是「改正入参后重发刚失败的那个动作」,坐标必须完整。"""
+        out = normalize_task(_task(cards=[_error_card()]))
+        card = out["cards"][0]
+        self.assertEqual(card["component"], "error")
+        self.assertEqual(card["data"]["code"], "1001")
+
+        (action,) = card["actions"]
+        self.assertEqual(action["id"], "confirm")
+        self.assertEqual(action["component"], "flight.booking-confirm")
+        self.assertEqual(action["retry_of"], "flight.booking-confirm#confirm")
+        self.assertEqual(action["role"], "retry")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

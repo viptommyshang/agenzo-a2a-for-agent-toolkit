@@ -46,8 +46,14 @@ from test_token_first_two_session import FakeBridge, _task_json  # noqa: E402
 
 
 # 代表性的「货币结算动作」卡片坐标（component, action）——满足 server._is_settle_action。
-_HOTEL_PAY = ("hotel.order-detail", "pay")          # hotel 锁后付：pay 才扣款
-_FLIGHT_CONFIRM = ("flight.booking-confirm", "confirm")  # 其它域在下单 confirm/book 扣款
+# 三个商户域（hotel / ride / flight）**都是 lock-then-pay**：其下单 confirm 只锁库存/运价、分文不碰
+# （其 confirm_action 也不接受任何支付凭证字段），扣款统一在订单卡的 `pay` 上。因此结算动作的代表
+# 坐标一律取各域的 `pay`，而不是 booking-confirm —— 后者是锁单门，在它上面断言"结算"是过时假设。
+_HOTEL_PAY = ("hotel.order-detail", "pay")
+_FLIGHT_PAY = ("flight.order-detail", "pay")
+_RIDE_PAY = ("ride.order-awaiting", "pay")
+# 锁单门（**非**结算动作）的代表坐标：护栏不该在这里误报。
+_RIDE_LOCK = ("ride.payment-confirm", "confirm")
 
 
 class R9NarrowingBridgeTest(unittest.IsolatedAsyncioTestCase):
@@ -91,16 +97,45 @@ class R9NarrowingBridgeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("default", out["payment_warning"].lower())
 
     async def test_unspecified_payment_default_is_domain_agnostic(self) -> None:
-        """跨域一致：flight 下单 confirm 未选 EVO 卡时，同样默认走令牌主路径、不默认 EVO。
+        """跨域一致：flight / ride 的结算步（`pay`）未选 EVO 卡时，同样默认走令牌主路径、不默认 EVO。
 
         Validates: Requirements 9.4
         """
         sid = await self._booking()
-        out = await server.act(sid, _FLIGHT_CONFIRM[0], _FLIGHT_CONFIRM[1], {})
+        for component, action in (_FLIGHT_PAY, _RIDE_PAY):
+            with self.subTest(component=component):
+                out = await server.act(sid, component, action, {})
+                self.assertIn("default_orchestration", out)
+                self.assertNotIn("evo_orchestration", out)
+                self.assertNotIn("token_path_failure", out)
 
-        self.assertIn("default_orchestration", out)
+    async def test_lock_step_is_not_treated_as_settlement(self) -> None:
+        """lock-then-pay 的**锁单**步不是结算动作：不附支付护栏警告、也不附令牌编排建议。
+
+        这道断言锁住一类双向接错：把锁单步当结算会**误报**（狼来了，会训练 agent 忽略护栏），
+        而真正扣款的 `pay` 步若被漏判则是**漏报** —— 后者是唯一一道防"静默走默认卡扣款"的护栏。
+        """
+        sid = await self._booking()
+        out = await server.act(sid, _RIDE_LOCK[0], _RIDE_LOCK[1], {})
+        self.assertNotIn("payment_warning", out)
+        self.assertNotIn("default_orchestration", out)
         self.assertNotIn("evo_orchestration", out)
-        self.assertNotIn("token_path_failure", out)
+
+    async def test_settle_action_detected_from_declared_carries(self) -> None:
+        """结算动作判定优先按**卡片声明的 ``carries``**（协议自描述），而非组件名/动作名猜测。
+
+        声明里含 payment_token_id / payment_method_id 的动作就是附凭证的那一步；不含的则不是。
+        这让新增或改名的域自动被正确覆盖，不必维护域名单。
+        """
+        server._action_decls["sid-decl"] = {
+            "acme.order-await#settle": {"carries": ("order_ref", "payment_token_id")},
+            "acme.plan-confirm#confirm": {"carries": ("plan_id",)},
+        }
+        try:
+            self.assertTrue(server._is_settle_action("sid-decl", "acme.order-await", "settle"))
+            self.assertFalse(server._is_settle_action("sid-decl", "acme.plan-confirm", "confirm"))
+        finally:
+            server._action_decls.pop("sid-decl", None)
 
     # ── R9.1：显式提供有效 payment_method_id → 走 EVO 兜底轨、不创建网络令牌 ────────────────────
     async def test_explicit_evo_optin_routes_to_evo_without_mint(self) -> None:
@@ -158,8 +193,8 @@ class R9NarrowingBridgeTest(unittest.IsolatedAsyncioTestCase):
         sid = await self._booking()
         out = await server.act(
             sid,
-            _FLIGHT_CONFIRM[0],
-            _FLIGHT_CONFIRM[1],
+            _FLIGHT_PAY[0],
+            _FLIGHT_PAY[1],
             {"payment_method_id": "pm_evo_1", "evo_explicit": True},
         )
         self.assertIn("evo_orchestration", out)

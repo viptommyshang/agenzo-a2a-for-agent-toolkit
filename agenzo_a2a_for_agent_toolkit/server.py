@@ -115,6 +115,10 @@ class _TokenVault:
 
 
 _token_vaults: dict[str, _TokenVault] = {}
+# 每个会话见过的卡片动作声明：``{session_id: {"<component>#<action>": {"carries": (...)}}}``。
+# 由 :func:`_remember_card_actions` 在每轮结果上填充，供 :func:`_is_settle_action` 按声明（而非
+# 按组件名 substring 猜测）判定"这个动作是否会实际扣款"。
+_action_decls: dict[str, dict[str, dict[str, Any]]] = {}
 
 
 def _vault(session_id: str) -> _TokenVault:
@@ -221,7 +225,48 @@ def _result(session_id: str, status: int, raw: str) -> dict[str, Any]:
         out = normalize_task(task, heavy_keys=frozenset())
     out["session_id"] = session_id
     out["member_id"] = _get_bridge().member_id
+    # 记下本轮卡片声明的动作 carries，供下一次 act 按声明判定结算动作（见 _remember_card_actions）。
+    _remember_card_actions(session_id, out)
     return out
+
+
+def _remember_card_actions(session_id: str, out: dict[str, Any]) -> None:
+    """记住本轮卡片声明的动作（按 ``<component>#<action>`` 索引其 ``carries``）。
+
+    为什么需要它：结算动作的判定此前只能靠**组件名/动作名 substring 猜测**，而"哪个动作花钱"
+    本来就是**协议自描述**的 —— 卡片 action 的 ``carries`` 里有没有支付凭证字段（
+    ``payment_token_id`` / ``payment_method_id``）。桥层每轮都已经解析出卡片，把这份声明记下来，
+    下一次 ``act`` 就能按声明判定，不必猜域名（lock-then-pay 的域在 ``pay`` 结算，单步域在
+    ``confirm``/``book`` 结算，靠 ``"hotel" in component`` 这类猜测必然漏域）。
+
+    纯本地缓存，不改变任何线上协议；缓存未命中时回退到名字判据（见 :func:`_is_settle_action`）。
+    """
+    decls = _action_decls.setdefault(session_id, {})
+    for card in out.get("cards") or ():
+        if not isinstance(card, dict):
+            continue
+        component = str(card.get("component") or "").strip()
+        if not component:
+            continue
+        for act in card.get("actions") or ():
+            if not isinstance(act, dict):
+                continue
+            action_id = str(act.get("id") or "").strip()
+            if not action_id:
+                continue
+            carries = act.get("carries")
+            decls[f"{component}#{action_id}"] = {
+                "carries": tuple(str(c) for c in carries) if isinstance(carries, (list, tuple)) else (),
+            }
+
+
+def _declared_carries(session_id: str, component: str, action: str) -> tuple[str, ...] | None:
+    """本次要发的动作在**上一轮卡片**里声明的 ``carries``；没见过这张卡时 ``None``。"""
+    decl = (_action_decls.get(session_id) or {}).get(f"{component}#{action}")
+    if decl is None:
+        return None
+    carries = decl.get("carries")
+    return carries if isinstance(carries, tuple) else ()
 
 
 def _tool_result(status: int, raw: str) -> dict[str, Any]:
@@ -238,50 +283,68 @@ def _tool_result(status: int, raw: str) -> dict[str, Any]:
     return obj if isinstance(obj, dict) else {"error": "unexpected response", "detail": _short(raw)}
 
 
-# Actions that SETTLE money (place/charge an order). WHICH action charges depends on the domain:
-# most domains charge at the order confirm/book, but HOTEL is lock-then-pay — its booking-confirm
-# only LOCKS inventory (no money), and the charge (with the user-chosen card) is on `pay`
-# (hotel.order-detail). Kept small on purpose to avoid false positives.
-_SETTLE_ACTIONS = {"confirm", "book"}
-_HOTEL_SETTLE_ACTIONS = {"pay"}
-# Fields that carry an explicit, user-chosen payment credential on a settle action.
+# Fields that carry an explicit, user-chosen payment credential on a settle action. These are also
+# the SELF-DESCRIBING signal for "this action settles money": a card action whose ``carries`` lists
+# one of them is, by construction, the step where the payment credential is attached.
 _PAYMENT_FIELDS = ("payment_method_id", "payment_token_id")
 
+# ── 名字判据（仅在没见过卡片声明时回退使用）────────────────────────────────────────
+# `pay` 恒为结算动作 —— 任何域的 `pay` 都在花钱。
+_SETTLE_ACTIONS_ALWAYS = {"pay"}
+# `confirm` / `book` 只在**单步下单**的域才结算。LOCK-THEN-PAY 的域（其 create-order 只锁库存/
+# 运价、分文不碰，扣款在 `pay`）必须排除，否则会同时造成两个错误：在锁单步**误报**，又在真正
+# 扣款的 `pay` 步**漏报**（漏报比误报危险 —— 那是唯一一道防「静默走默认卡扣款」的护栏）。
+_SETTLE_ACTIONS_SINGLE_STEP = {"confirm", "book"}
+# 采用 lock-then-pay 的商户域（组件 id 前缀）。三域（hotel / ride / flight）的 create-order 都只
+# 锁价、返回 order_ref/order_no，扣款统一在 `pay`（见各 schema 的 write.pay-order）。
+_LOCK_THEN_PAY_DOMAINS = ("hotel", "ride", "flight")
+# 明确**不**扣款的动作/卡片（取消、退款、作废、入住退房），以及独立支付场景自己的 confirm
+# （``payment.pay-confirm`` —— 卡在流程内经 ``select-method`` 选定并经 ``$collected`` 串联，
+# 不是必须在 payload 里带凭据的商户下单 confirm）。
+_NON_SETTLE_COMPONENT_HINTS = ("cancel", "refund", "void", "check-out", "pay-confirm")
 
-def _is_settle_action(component: str, action: str) -> bool:
-    """判断本次卡片动作是否为「会实际扣款/收钱」的货币结算动作（与支付凭据无关，只看组件+动作）。
+
+def _is_settle_action(session_id: str, component: str, action: str) -> bool:
+    """判断本次卡片动作是否为「会实际扣款/收钱」的货币结算动作。
 
     这是 ``_settle_without_payment`` 与显式 EVO 分流（``_explicit_evo_no_mint``）共用的结算动作判定，
-    抽取出来保证两处口径完全一致、避免漂移。判定范围刻意收窄（仅下单/支付卡上的 settle 动作），
-    不会误伤取消这类无关 confirm。"""
+    抽取出来保证两处口径完全一致、避免漂移。
+
+    判据按优先级：
+
+    1. **卡片声明（权威、协议自描述）** —— 上一轮卡片里该动作的 ``carries`` 含
+       ``payment_token_id`` / ``payment_method_id`` → 这就是附支付凭证的那一步，即结算动作；
+       见过这张卡但 ``carries`` 不含凭证字段 → **不是**结算动作。这条判据不需要知道任何域名，
+       因此新增/改名的域自动被正确覆盖。
+    2. **名字判据（回退）** —— 没见过这张卡（agent 未先读卡就直接 ``act``）时才用：``pay`` 恒算
+       结算；``confirm`` / ``book`` 只在非 lock-then-pay 的域算结算。
+    """
     act = (action or "").strip().lower()
     comp = (component or "").lower()
-    # Skip actions that do NOT charge the card (cancellations, refunds, void, check-out), and the
-    # STANDALONE payment scenario's own confirm (``payment.pay-confirm``): there the card is chosen
-    # in-flow via ``select-method`` and threaded through ``$collected`` — it is not a merchant order
-    # confirm that must carry a payment credential in its payload, so the advisory would misfire.
-    # ("pay-confirm" is deliberately NOT a substring of "ride.payment-confirm", so merchant confirms
-    # stay flagged.)
-    if any(k in comp for k in ("cancel", "refund", "void", "checkout", "check-out", "pay-confirm")):
+    # 取消 / 退款 / 作废 / 独立支付自身 confirm：一律不算结算（这条对两种判据都成立，先短路）。
+    if any(k in comp for k in _NON_SETTLE_COMPONENT_HINTS):
         return False
-    # HOTEL is lock-then-pay: its booking-confirm only LOCKS inventory (no money) — the charge, with
-    # the user-chosen card, is on `pay` (hotel.order-detail). Every other domain charges at the order
-    # confirm/book. (Hotel's 3DS `resume` reuses a persisted preauth and is intentionally NOT here.)
-    # Selecting the settle action per-domain avoids BOTH a false-positive on hotel's non-charging
-    # booking-confirm AND a miss on hotel's charging `pay`.
-    settle_actions = _HOTEL_SETTLE_ACTIONS if "hotel" in comp else _SETTLE_ACTIONS
-    if act not in settle_actions:
-        return False
-    return any(k in comp for k in ("confirm", "booking", "payment", "order"))
+
+    # ① 卡片声明优先：`carries` 里有支付凭证字段的动作，就是结算动作。
+    carries = _declared_carries(session_id, component, action)
+    if carries is not None:
+        return any(f in carries for f in _PAYMENT_FIELDS)
+
+    # ② 回退到名字判据。
+    if act in _SETTLE_ACTIONS_ALWAYS:
+        return True
+    if act in _SETTLE_ACTIONS_SINGLE_STEP and not any(d in comp for d in _LOCK_THEN_PAY_DOMAINS):
+        return any(k in comp for k in ("confirm", "booking", "payment", "order"))
+    return False
 
 
-def _settle_without_payment(component: str, action: str, payload: dict[str, Any]) -> bool:
+def _settle_without_payment(session_id: str, component: str, action: str, payload: dict[str, Any]) -> bool:
     """Detect an order action that SETTLES money but carries no explicit, user-chosen payment
     credential. Used to attach a NON-BLOCKING advisory to the result — the action is still
     forwarded to the orchestrator (any HARD stop belongs in the orchestrator/merchant backend, not
     in this thin bridge). Deliberately narrow (settle actions on booking/payment cards only) so it
     does not fire on unrelated confirms such as cancellations."""
-    if not _is_settle_action(component, action):
+    if not _is_settle_action(session_id, component, action):
         return False
     return not any(str((payload or {}).get(f) or "").strip() for f in _PAYMENT_FIELDS)
 
@@ -299,7 +362,7 @@ def _evo_explicit(payload: dict[str, Any]) -> bool:
     return str(v or "").strip().lower() in ("true", "1", "yes", "on")
 
 
-def _needs_token_mint(component: str, action: str, payload: dict[str, Any]) -> bool:
+def _needs_token_mint(session_id: str, component: str, action: str, payload: dict[str, Any]) -> bool:
     """默认令牌主路径触发判据：本次是货币结算动作、**未**携带 payment_token_id、且**未**显式选 EVO
     （``evo_explicit`` 非真）。
 
@@ -308,7 +371,7 @@ def _needs_token_mint(component: str, action: str, payload: dict[str, Any]) -> b
       ② payload 带 ``payment_method_id``（已选/已有一张绑卡）但**未**显式选 EVO —— 已有卡**不**是跳过
          创建网络令牌的理由，应用**这张卡**创建网络令牌（在 create-token 流程里选它，无需重新绑卡）。
     仅当已携带 payment_token_id（正走令牌直扣）或显式选了 EVO（``evo_explicit=true``）时不触发。"""
-    if not _is_settle_action(component, action):
+    if not _is_settle_action(session_id, component, action):
         return False
     p = payload or {}
     has_token = bool(str(p.get("payment_token_id") or "").strip())
@@ -321,8 +384,9 @@ _PAYMENT_WARNING = (
     "start_payment() and let the USER pick a card BEFORE this step — omitting it can cause a "
     "silent charge to a platform/member default card. If this action settles money, verify or cancel "
     "the order, then redo it carrying the payment credential the user explicitly selected. "
-    "(Hotel is lock-then-pay: it charges at `pay` on hotel.order-detail — attach the card THERE, not "
-    "at booking-confirm, which only locks the room.)"
+    "(HOTEL / RIDE / FLIGHT are all lock-then-pay: their create-order step only LOCKS the room / "
+    "fare (no money) and the charge happens at `pay` on the order card — attach the credential "
+    "THERE. Read the action's `carries` to find which field name to send.)"
 )
 
 
@@ -364,7 +428,7 @@ _DEFAULT_TOKEN_ORCHESTRATION = (
 
 
 def _default_token_orchestration_advice(
-    component: str, action: str, payload: dict[str, Any]
+    session_id: str, component: str, action: str, payload: dict[str, Any]
 ) -> str | None:
     """方案 A 软引导（R14.1）：判断是否应对本次货币结算动作附「默认走独立 Network_Token 现结
     三段式主路径」的非阻塞编排建议，返回建议文案或 ``None``。
@@ -373,7 +437,7 @@ def _default_token_orchestration_advice(
     且未显式选 EVO（``evo_explicit`` 非真）。这**包含**「payload 带 payment_method_id（选了已绑卡）
     但未显式选 EVO」的情形——已有卡默认也应先用该卡创建网络令牌，故此时仍给三段式主路径建议。仅当已带
     payment_token_id（正走令牌直扣）或显式选了 EVO（``evo_explicit=true``）时返回 ``None``。"""
-    if not _needs_token_mint(component, action, payload):
+    if not _needs_token_mint(session_id, component, action, payload):
         return None
     return _DEFAULT_TOKEN_ORCHESTRATION
 
@@ -401,7 +465,7 @@ _EXPLICIT_EVO_ORCHESTRATION = (
 )
 
 
-def _explicit_evo_no_mint(component: str, action: str, payload: dict[str, Any]) -> bool:
+def _explicit_evo_no_mint(session_id: str, component: str, action: str, payload: dict[str, Any]) -> bool:
     """方案 A 软引导（R14.2）：判断本次货币结算动作是否为**显式 EVO 直扣**（因而应明确走 EVO 兜底轨、
     **不创建** Network_Token）。
 
@@ -411,7 +475,7 @@ def _explicit_evo_no_mint(component: str, action: str, payload: dict[str, Any]) 
     已绑卡）但无 ``evo_explicit`` **不**触发本分支——那种情况归默认令牌主路径（用该卡创建网络令牌），由
     ``_needs_token_mint`` 承接。据此把「显式 EVO → 走 EVO、不创建网络令牌」与默认令牌主路径以 ``evo_explicit``
     为界互斥切分。"""
-    if not _is_settle_action(component, action):
+    if not _is_settle_action(session_id, component, action):
         return False
     p = payload or {}
     has_token = bool(str(p.get("payment_token_id") or "").strip())
@@ -419,11 +483,11 @@ def _explicit_evo_no_mint(component: str, action: str, payload: dict[str, Any]) 
 
 
 def _explicit_evo_orchestration_advice(
-    component: str, action: str, payload: dict[str, Any]
+    session_id: str, component: str, action: str, payload: dict[str, Any]
 ) -> str | None:
     """方案 A 软引导（R14.2）：显式 EVO 分流时返回「走 EVO 兜底轨、不创建网络令牌」的非阻塞引导文案，
     否则返回 ``None``。"""
-    if not _explicit_evo_no_mint(component, action, payload):
+    if not _explicit_evo_no_mint(session_id, component, action, payload):
         return None
     return _EXPLICIT_EVO_ORCHESTRATION
 
@@ -497,9 +561,9 @@ def _token_path_stage(
     p = payload or {}
     if str(p.get("payment_token_id") or "").strip():
         return "charge"
-    if _explicit_evo_no_mint(component, action, p):
+    if _explicit_evo_no_mint(session_id, component, action, p):
         return None
-    if _is_settle_action(component, action):
+    if _is_settle_action(session_id, component, action):
         return "lock"
     return None
 
@@ -706,11 +770,13 @@ async def act(session_id: str, component: str, action: str, payload: dict[str, A
 
     To attach a payment result, include ``payment_token_id`` (UnionPay) or ``payment_method_id``
     (EVO/Visa/Mastercard) in the payload of the action that SETTLES money (see ``start_payment``).
-    That action varies by domain: most domains charge at the order ``confirm``/``book``, but HOTEL is
-    lock-then-pay — its ``booking-confirm#confirm`` only LOCKS the room (no charge), and the payment
-    method goes on ``hotel.order-detail#pay``. Whichever action settles money MUST carry the payment
-    method the USER explicitly chose — never omit it to fall back to a platform/member default charge.
-    Read the action's ``carries`` to know which field name to send."""
+    DO NOT GUESS WHICH ACTION THAT IS — read the action's ``carries``: the settling action is the one
+    whose ``carries`` lists ``payment_token_id`` / ``payment_method_id``. HOTEL, RIDE and FLIGHT are
+    all lock-then-pay: their order ``confirm`` only LOCKS the room / fare and moves NO money (it does
+    NOT accept a payment credential), while the charge happens at ``pay`` on the resulting order card
+    (``hotel.order-detail#pay`` / ``ride.order-awaiting#pay`` / ``flight.order-detail#pay``). Whichever
+    action settles money MUST carry the payment method the USER explicitly chose — never omit it to
+    fall back to a platform/member default charge."""
     bridge = _get_bridge()
     payload = payload or {}
     # Swap any short token handle the model copied from a slimmed card back to the real opaque token
@@ -738,16 +804,16 @@ async def act(session_id: str, component: str, action: str, payload: dict[str, A
         out["token_path_failure"] = fail_advice
         return out
     if "error" not in out:
-        evo_advice = _explicit_evo_orchestration_advice(component, action, payload)
+        evo_advice = _explicit_evo_orchestration_advice(session_id, component, action, payload)
         if evo_advice:
             out["evo_orchestration"] = evo_advice
         else:
-            advice = _default_token_orchestration_advice(component, action, payload)
+            advice = _default_token_orchestration_advice(session_id, component, action, payload)
             if advice:
                 out["default_orchestration"] = advice
                 # 「未选任何卡、可能被静默扣默认卡」的警告仅在**真的无任何支付凭据**时附上；
                 # 若已带 payment_method_id（选了已绑卡、只是默认应先用它创建网络令牌），该前提不成立，不附。
-                if _settle_without_payment(component, action, payload):
+                if _settle_without_payment(session_id, component, action, payload):
                     out["payment_warning"] = _PAYMENT_WARNING
     return out
 
@@ -1040,9 +1106,30 @@ async def resolve_location(address: str) -> dict[str, Any]:
 
     ``address`` — a place name or address, e.g. "Shanghai Pudong Airport" or "The Bund, Shanghai".
 
-    Returns ``{lat, lng, formatted_address, timezone}`` on success (use lat/lng at ride.search submit,
-    and pass the returned ``timezone`` to ``resolve_pickup_time``); or ``{error: ...}`` when geocoding
-    is unconfigured/fails — then ask the user for exact coordinates."""
+    CALL IT ONCE PER LOCATION. The answer is authoritative even when it reports a coarse match —
+    the coordinates are usable and you should proceed with them.
+
+    Returns ``{lat, lng, formatted_address, timezone, precision, partial_match, location_type?,
+    match_types?, precision_warning?, match_note?}`` on success (use lat/lng at ride.search submit,
+    and pass the returned ``timezone`` to ``resolve_pickup_time``); or ``{error: ...}`` when
+    geocoding is unconfigured/fails — then ask the user for exact coordinates.
+
+    ``precision`` (exact / interpolated / approximate / unknown) is about the COORDINATES.
+    ``precision_warning`` appears only when they are coarse (street/area level: the house number was
+    dropped and the point sits at the centre of that street). The driver navigates by the
+    COORDINATES, so that is a possibly-missed pickup rather than a cosmetic issue — but the fix is
+    the USER's, not yours:
+      • DO proceed with these coordinates, and pass ``formatted_address`` back on ride.search#submit
+        (``pickupFormattedAddress`` / ``dropoffFormattedAddress``) so the confirm card shows what was
+        matched next to what the user said, letting them confirm or correct it before the fare locks.
+      • DO NOT call this tool again with reworded variants of the same address, and DO NOT substitute
+        a different address or landmark you picked yourself — a nearby building with another street
+        number is a DIFFERENT destination. Re-resolve only when the USER gives a new address.
+
+    ``partial_match`` is a separate thing: it means the address STRING was not matched verbatim, and
+    it is independent of coordinate precision (building-level coordinates with partial_match=true is
+    a normal combination). When the coordinates are precise you get a neutral ``match_note`` instead
+    of a warning — nothing to fix, just worth echoing the matched address."""
     bridge = _get_bridge()
     try:
         status, raw = await bridge.call_tool("/orch-public/tools/resolve-location", {"address": address})
@@ -1215,11 +1302,14 @@ PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (ow
     act(session_id, component, action, payload) — do NOT send natural-language send_message there
     (free text in a payment sub-flow gets misrouted to hotel-search / refused). Reuse ONE payment
     session_id for the whole sub-flow; do not open a new session per step.
-  • When you have the resolved credential, attach it to the payload of the money-settling action
-    (most domains: the booking `confirm`; HOTEL: `pay` on hotel.order-detail — its booking-confirm
-    only locks). That action's `carries` names the field (payment_token_id for the token main path;
-    payment_method_id ONLY for the explicit/fallback EVO rail). Do NOT omit it to let the platform
-    charge a default — the settling action must always carry the credential resolved above.
+  • When you have the resolved credential, attach it to the payload of the money-settling action.
+    IDENTIFY THAT ACTION FROM ITS `carries`, never from its name: the settling action is the one whose
+    `carries` lists payment_token_id / payment_method_id. HOTEL, RIDE and FLIGHT are all lock-then-pay
+    — their order `confirm` only LOCKS (no money, no credential accepted) and the charge is at `pay`
+    on the resulting order card (hotel.order-detail#pay / ride.order-awaiting#pay /
+    flight.order-detail#pay). The `carries` also names the field (payment_token_id for the token main
+    path; payment_method_id ONLY for the explicit/fallback EVO rail). Do NOT omit it to let the
+    platform charge a default — the settling action must always carry the credential resolved above.
 
 TRIP AGGREGATE PAYMENT — settle a whole cart of locked orders in ONE charge (trip checkout)
   When a session locked SEVERAL orders (e.g. a multi-room hotel trip, or a flight+hotel trip), the
@@ -1257,6 +1347,12 @@ RIDES — resolve on the client BEFORE submitting a ride search
     resolve_pickup_time(local_iso, timezone) -> {epoch} (use the literal "now" for immediate).
     Never guess coordinates or epochs. Put the returned values into the ride search submit payload
     (the exact field names come from that card's `data` / action `carries`).
+  • ONE resolve_location call per location, then SUBMIT. A `precision_warning` in the result does not
+    block anything: keep those coordinates, pass `formatted_address` along, and let the USER confirm
+    the matched address on the confirm card. Do not loop on re-resolving a reworded address and do
+    not pick a substitute landmark — that stalls the booking and can silently change the destination.
+  • The ride entry card states its own submit contract: read `data.required_fields` /
+    `data.missing_required` (and the `recommended_*` pair) instead of guessing which fields it wants.
 
 DEBUGGING
   • inspect(session_id?, limit?) dumps the exact A2A JSON-RPC request/response (the raw protocol).
