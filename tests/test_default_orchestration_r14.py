@@ -323,6 +323,31 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
             text,
         )
 
+    # ── 修法B：解绑停用确认不是结算动作——即便盲发（名字回退判据）也不挂任何令牌软引导 ───────────
+    async def test_remove_method_confirm_is_not_a_settle_action(self) -> None:
+        """``payment.method-remove-confirm#confirm`` 是账户生命周期操作（解绑停用已绑卡），分文不动，
+        不是货币结算动作，故**不应**附任何令牌 / 扣款软引导。
+
+        这里刻意走**最坏情形**：客户端未先读该确认卡就直接 ``act``（``_action_decls`` 无此动作声明），
+        于是 ``_is_settle_action`` 落到名字回退判据——组件名含 ``payment``+``confirm`` 又非 lock-then-pay
+        域，没有豁免就会被误判成结算。``_NON_SETTLE_COMPONENT_HINTS`` 的 ``method-remove`` 兜住它。
+        并且即便 payload 带了 ``payment_method_id``（被停用的卡 id），也不改变「非结算」判定。
+
+        Validates: 修法B（remove-method 非结算豁免）
+        """
+        sid = await self._booking_sid("m-remove")
+        self.fake.queue_action_response(200, _task_json(state="completed"))
+        out = await server.act(
+            sid,
+            "payment.method-remove-confirm",
+            "confirm",
+            {"payment_method_id": "pm_to_remove"},
+        )
+        self.assertNotIn("default_orchestration", out)
+        self.assertNotIn("payment_warning", out)
+        self.assertNotIn("evo_orchestration", out)
+        self.assertNotIn("token_path_failure", out)
+
     # ── 辅助 ─────────────────────────────────────────────────────────────────────
     async def _booking_sid(self, member_id: str) -> str:
         booking = await server.book("book a hotel near the Bund", member_id=member_id)

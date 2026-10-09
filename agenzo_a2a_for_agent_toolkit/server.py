@@ -119,6 +119,13 @@ _token_vaults: dict[str, _TokenVault] = {}
 # 由 :func:`_remember_card_actions` 在每轮结果上填充，供 :func:`_is_settle_action` 按声明（而非
 # 按组件名 substring 猜测）判定"这个动作是否会实际扣款"。
 _action_decls: dict[str, dict[str, dict[str, Any]]] = {}
+# 每个会话见过的**入口 form 卡**的标量预填字段：``{session_id: {component: {field: value}}}``。
+# 编排器在 form 卡的 ``data`` 里按抽取结果预填 llm_field（如 ``list_statuses="ACTIVE,DISABLED,…"``），
+# 但表单是**无状态**的：客户端提交时必须把这些值回传，否则编排器 capture 步回落字段默认值（如列卡
+# 只列 ACTIVE、看不到停用卡）。由 :func:`_remember_card_actions` 记下每张 form 卡的标量预填，
+# :func:`act` 在提交时为被调用方**漏传**的字段用它兜底（调用方显式给的值永远优先）。只存标量、跳过
+# 数组/对象——像 ``ride.search`` 的 ``required_fields``/``missing_required`` 是**展示用元信息**、不是提交字段。
+_form_prefills: dict[str, dict[str, dict[str, Any]]] = {}
 
 
 def _vault(session_id: str) -> _TokenVault:
@@ -258,6 +265,14 @@ def _remember_card_actions(session_id: str, out: dict[str, Any]) -> None:
             decls[f"{component}#{action_id}"] = {
                 "carries": tuple(str(c) for c in carries) if isinstance(carries, (list, tuple)) else (),
             }
+        # 入口 form 卡的标量预填：记下供下一次 ``act`` 为漏传字段兜底（见 _form_prefills / act）。
+        # 只收标量——数组/对象（如 ride.search 的 required_fields）是展示用元信息、不是提交字段。
+        if str(card.get("kind") or "").strip().lower() == "form":
+            data = card.get("data")
+            if isinstance(data, dict):
+                _form_prefills.setdefault(session_id, {})[component] = {
+                    k: v for k, v in data.items() if isinstance(v, (str, int, float, bool)) and v != ""
+                }
 
 
 def _declared_carries(session_id: str, component: str, action: str) -> tuple[str, ...] | None:
@@ -267,6 +282,11 @@ def _declared_carries(session_id: str, component: str, action: str) -> tuple[str
         return None
     carries = decl.get("carries")
     return carries if isinstance(carries, tuple) else ()
+
+
+def _form_prefill(session_id: str, component: str) -> dict[str, Any]:
+    """本会话上一张同名**入口 form 卡**的标量预填字段（供 :func:`act` 为漏传字段兜底）；没见过则空。"""
+    return dict((_form_prefills.get(session_id) or {}).get(component) or {})
 
 
 def _tool_result(status: int, raw: str) -> dict[str, Any]:
@@ -298,10 +318,13 @@ _SETTLE_ACTIONS_SINGLE_STEP = {"confirm", "book"}
 # 采用 lock-then-pay 的商户域（组件 id 前缀）。三域（hotel / ride / flight）的 create-order 都只
 # 锁价、返回 order_ref/order_no，扣款统一在 `pay`（见各 schema 的 write.pay-order）。
 _LOCK_THEN_PAY_DOMAINS = ("hotel", "ride", "flight")
-# 明确**不**扣款的动作/卡片（取消、退款、作废、入住退房），以及独立支付场景自己的 confirm
-# （``payment.pay-confirm`` —— 卡在流程内经 ``select-method`` 选定并经 ``$collected`` 串联，
-# 不是必须在 payload 里带凭据的商户下单 confirm）。
-_NON_SETTLE_COMPONENT_HINTS = ("cancel", "refund", "void", "check-out", "pay-confirm")
+# 明确**不**扣款的动作/卡片（取消、退款、作废、入住退房、解绑停用已绑卡），以及独立支付场景
+# 自己的 confirm（``payment.pay-confirm`` —— 卡在流程内经 ``select-method`` 选定并经 ``$collected``
+# 串联，不是必须在 payload 里带凭据的商户下单 confirm）。``method-remove`` 覆盖
+# ``payment.method-remove`` / ``-confirm`` / ``-result``（解绑停用是账户生命周期操作、分文不动）：其
+# confirm 本就不携带支付凭据，按卡片声明已判非结算；此处再按组件名豁免，兜住"客户端未先读卡、落到
+# 名字回退判据"时——组件名含 ``payment``+``confirm`` 又非 lock-then-pay 域——被误判成结算的情形。
+_NON_SETTLE_COMPONENT_HINTS = ("cancel", "refund", "void", "check-out", "pay-confirm", "method-remove")
 
 
 def _is_settle_action(session_id: str, component: str, action: str) -> bool:
@@ -719,6 +742,12 @@ async def book(request: str, member_id: str = "") -> dict[str, Any]:
         Passenger: Richard Chen, passport E1234567, phone +86 13275666789, richard@example.com."
       - "Book a hotel near the Bund in Shanghai, 1 adult, check-in Aug 18, check-out Aug 19.
         Guest Richard Chen, phone 13275666789."
+      - "List my cards."  — read-only card management STARTS HERE (not via ``start_payment``):
+        listing/viewing cards, disabling a card ("disable the card ending 1234"), or adding one;
+        no amount or payment session needed, then drive the returned card with ``act(...)``.
+        Pass the user's words VERBATIM: a plain "list my cards" is meant to show only ACTIVE/usable
+        cards, so include a status qualifier ("including disabled" / "all statuses") ONLY when the
+        USER actually asked for it — never add "all statuses" on your own.
 
     Returns ``{session_id, cards, text, state, primary_component, member_id}``. Read the last card's
     ``component``/``data``/``actions`` and advance with ``act(session_id, ...)``; use
@@ -779,6 +808,12 @@ async def act(session_id: str, component: str, action: str, payload: dict[str, A
     fall back to a platform/member default charge."""
     bridge = _get_bridge()
     payload = payload or {}
+    # 入口 form 卡的预填字段兜底：编排器已把抽取结果（如 list_statuses）预填进上一张 form 卡的 data，
+    # 但表单是无状态的——调用方提交时漏传这些值会让编排器 capture 回落字段默认（如列卡只列 ACTIVE、
+    # 看不到停用卡）。为调用方**未显式给**的预填字段补上（调用方给的永远优先），闭合「预填却没回传」缺口。
+    prefill = _form_prefill(session_id, component)
+    if prefill:
+        payload = {**prefill, **payload}
     # Swap any short token handle the model copied from a slimmed card back to the real opaque token
     # before it goes on the wire (no-op if this session minted no handles). Done first so both the
     # A2A call and the soft-guidance below see the real payment_token_id / product_token.
@@ -862,6 +897,15 @@ async def start_payment(
     drives the payment ``pay-setup`` scenario and by itself NEVER charges the card (no charge, no
     ``charge_no``).
 
+    NOT A CARD-LISTING / CARD-MANAGEMENT TOOL. To merely LIST or VIEW the member's saved cards
+    (read-only) — or to disable / add a card — do NOT call this. Use ``book("list my cards")``
+    (append "… including disabled / all statuses" ONLY if the user asked for it), which runs the
+    read-only ``list-methods``
+    scenario and can filter by status, then drive the returned ``payment.method-view`` form with
+    ``act(...)``. The picker THIS tool returns is a payment pre-step: it requires an ``amount_cents``
+    and only surfaces ACTIVE (usable) cards, so it can NEVER show disabled / pending ones — never
+    invent an amount (e.g. 100) or a ``recipient_name`` (e.g. "Card Holder") just to see the cards.
+
     NOT THE DEFAULT MAIN PATH. For a pay-per-call order where the user has NOT explicitly chosen an
     EVO card, the DEFAULT is an INDEPENDENT Network_Token direct charge via ``start_token_creation``
     (create-order to lock the order_id + authoritative amount → mint a Network_Token bound to that
@@ -880,9 +924,10 @@ async def start_payment(
     path.
 
     Start a SEPARATE payment session (independent context) to pick/verify a payment method BEFORE
-    confirming an order. This is BRAND-AGNOSTIC — it returns the method-picker card listing ALL the
-    member's payment methods (UnionPay AND EVO Visa/Mastercard); each row carries an ``id`` and a
-    ``payment_brand``. It does NOT force UnionPay.
+    confirming an order. This is BRAND-AGNOSTIC across the cards it surfaces (UnionPay AND EVO
+    Visa/Mastercard); each row carries an ``id`` and a ``payment_brand``. It does NOT force UnionPay.
+    The picker is for CHOOSING a usable card to pay with — it lists only ACTIVE cards, NOT a full or
+    read-only inventory; to just browse / view cards (including disabled) use ``book("list my cards …")``.
 
     USER-DRIVEN (explicit/fallback only). Do NOT call this as the default pre-step for every settle —
     that is ``start_token_creation`` (see above). When this EVO rail IS used, never confirm without a
@@ -1223,6 +1268,17 @@ ANSWERING THE SERVER
     session (start_payment / book "add a payment method …"), then return to checkout and re-open the
     method picker — the newly bound card shows up there (booking + payment must share the same
     member_id). Checkout method pickers only offer `select-method`, not `add-method`, for this reason.
+
+CARD MANAGEMENT (list / view / disable / add a card) — ALWAYS via book(), NEVER start_payment
+  • To LIST or VIEW the member's saved cards, start with book("list my cards") — pass the user's
+    words as-is. A plain "list my cards" shows only ACTIVE (usable) cards by design; include a status
+    qualifier ("including disabled" / "all statuses") ONLY when the USER explicitly asked for it — do
+    NOT add it yourself. This runs the read-only list-methods scenario — NO amount, NO payment
+    session; drive the returned payment.method-view form with act(...).
+  • To DISABLE/unbind a card: book("disable the card ending 1234") / book("remove a card"); to ADD
+    one: book("add a card").
+  • start_payment is NOT a way to see cards — its picker requires an amount and surfaces only ACTIVE
+    cards (never disabled/pending). Do not invent an amount or recipient just to browse cards.
 
 PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (own session)
   • Booking + payment MUST share the same member_id.
