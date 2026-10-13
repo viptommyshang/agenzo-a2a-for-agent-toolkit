@@ -293,6 +293,12 @@ def normalize_task(
         replaced by short handles both in ``data`` and in the rendered ``text``; the bridge resolves
         them back before sending an ``act``. Without it, tokens pass through verbatim.
       - ``str_cap`` (0 = off) truncates any other over-long string as a last-resort backstop.
+
+    When at least one token handle is minted this turn, the result also carries ``token_handles`` =
+    ``{"handles": [...], "note": "..."}`` — a self-describing hint telling the model that a ``@tokN``
+    value is a *usable reference* to pass back verbatim (the bridge resolves it to the real token on
+    ``act``), so it never needs to recover the real token or re-run the search to "get a usable" one.
+    Domain-agnostic: it describes only the handle convention, never any card/field name.
     """
     if not isinstance(task, dict):
         return {"state": "", "text": "", "cards": [], "primary_component": None}
@@ -335,12 +341,31 @@ def normalize_task(
         if real:
             text = text.replace(real, handle)
 
-    return {
+    result: dict[str, Any] = {
         "state": task_state(task),
         "text": text,
         "cards": cards,
         "primary_component": cards[-1]["component"] if cards else None,
     }
+    # Self-describing hint for the handles minted THIS turn: tell the model a @tokN value is a usable
+    # reference (pass it back verbatim; the bridge resolves it on ``act``), so it does not treat the
+    # handle as a redaction to recover or re-query. Only present when something was actually minted —
+    # a turn that touched no long tokens is byte-for-byte unchanged. Domain-agnostic (no card/field).
+    if minted:
+        handles = list(dict.fromkeys(h for _real, h in minted))
+        result["token_handles"] = {
+            "handles": handles,
+            "note": (
+                "Values shown as @tokN are SHORT HANDLES standing in for long opaque tokens, swapped "
+                "only to save context. A handle is directly USABLE: when an action's `carries` names "
+                "such a field, copy the @tokN value VERBATIM into the act() payload — the bridge "
+                "restores the real token before it reaches the orchestrator. You never need the real "
+                "token. Do NOT treat @tokN as redacted/lost, do NOT ask the user for it, and do NOT "
+                "re-run the search to 'get a usable token' (that just starts a fresh, re-priced list "
+                "with new handles). Handles are valid for THIS session."
+            ),
+        }
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────

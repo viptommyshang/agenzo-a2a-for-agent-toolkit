@@ -789,7 +789,10 @@ async def act(session_id: str, component: str, action: str, payload: dict[str, A
       chosen list row's data). For a form ``submit``/``confirm``, send the fields present in the
       card's ``data`` plus anything the user supplied. An action carrying a ``scenario`` navigates
       to that scenario; an action with ``capability:"open_url"`` needs ``open_url`` on the URL at
-      its ``data_ref`` then its ``callback`` id.
+      its ``data_ref`` then its ``callback`` id. If a ``carries`` field's value is shown as a short
+      handle like ``@tok3`` (a context-saving stand-in for a long opaque token), pass that ``@tok3``
+      back VERBATIM — the bridge restores the real token before sending; never try to recover or
+      re-query the real value.
 
     USER CHOOSES — never auto-select. When the current card offers a CHOICE (a list with multiple
     rows, or several options: hotels, room types, room rates, flight offers, vehicle classes, payment
@@ -1256,6 +1259,17 @@ BUILDING THE PAYLOAD — read it from the card, do not guess
     open the URL at the card's `data[<data_ref>]` via open_url(...), have the user finish, then send
     the action's `callback` id (carrying whatever it lists). Poll any `*-await` card with
     poll(session_id, component) until `data.status == "ACTIVE"` (or another terminal state).
+
+OPAQUE TOKEN HANDLES — @tokN values are USABLE AS-IS (never try to "recover" the real token)
+  Long opaque tokens (the big blobs some cards carry) are shown to you as SHORT HANDLES like
+  `@tok1`, `@tok3`. This is a context-saving substitution ONLY — the handle is a fully usable
+  reference. When an action `carries` a field whose value is a `@tokN`, copy that `@tokN` VERBATIM
+  into the act() payload; the bridge swaps it back to the real token before it reaches the
+  orchestrator, so you NEVER need the underlying value. Do NOT treat `@tokN` as redacted or lost,
+  do NOT ask the user for the real token, and do NOT re-run the search "to get a usable token" —
+  re-querying only starts a fresh, re-priced list with new handles and loses your place. When a
+  turn minted handles, the tool result also includes a `token_handles` hint saying exactly this.
+  Just send the option the user picked straight back by its `@tokN` (valid for THIS session).
 
 ANSWERING THE SERVER
   • A response with `text` and no cards means the server is asking/telling you something  ->  reply

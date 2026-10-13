@@ -298,6 +298,32 @@ class ProjectionTest(unittest.TestCase):
         slim_len = len(json.dumps(slim["cards"][0]["data"], ensure_ascii=False))
         self.assertLess(slim_len, full_len // 2)  # 至少砍掉一半
 
+    def test_minted_handles_carry_a_self_describing_hint(self) -> None:
+        """A turn that minted handles must say what @tokN means, so the model uses it as a usable
+        reference instead of re-querying to 'recover the real token'."""
+        out = normalize_task(_task(cards=[_offer_card()]), mint_handle=lambda _r: "@tok1")
+        self.assertIn("token_handles", out)
+        self.assertEqual(out["token_handles"]["handles"], ["@tok1"])
+        note = out["token_handles"]["note"].lower()
+        self.assertIn("@tokn", note)       # explains the convention itself
+        self.assertIn("verbatim", note)    # tells the model to pass it back as-is
+
+    def test_no_hint_when_nothing_was_minted(self) -> None:
+        """Short ids never become handles → no mint → no hint key (byte-for-byte unchanged shape)."""
+        card = {
+            "component": "hotel.order-detail",
+            "kind": "detail",
+            "data": {"order_id": "hho_ISO1", "charge_no": "chg_ABC123", "amount_minor": 4280},
+            "actions": [{"id": "pay", "carries": ["order_id"]}],
+        }
+        out = normalize_task(_task(cards=[card]), mint_handle=lambda _r: "@tok1")
+        self.assertNotIn("token_handles", out)
+
+    def test_no_hint_when_minting_disabled(self) -> None:
+        """No mint_handle → tokens pass through verbatim → no hint key."""
+        out = normalize_task(_task(cards=[_offer_card()]))
+        self.assertNotIn("token_handles", out)
+
     def test_booking_confirm_zero_carries(self) -> None:
         out = normalize_task(_task(cards=[_confirm_card()]), mint_handle=lambda _r: "@tok1")
         card = out["cards"][0]
