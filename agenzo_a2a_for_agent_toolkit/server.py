@@ -963,11 +963,15 @@ async def start_payment(
         send the action's ``callback`` id, then ``poll(session_id, component)`` until
         ``data.status == "ACTIVE"``. Use the resulting credential in the booking confirm.
       - NO method listed / want a NEW card: use the picker's scenario-jump action (``add-method``)
-        to bind one, then submit the add-method form. That form REQUIRES ``user_email``; the optional
-        ``brand`` only chooses **which rail**, NOT the card brand:
+        to bind one, then submit the add-method form. **Every field on that form is OPTIONAL — submit
+        it with an EMPTY payload ``{}``.** In particular do NOT ask the user for an email: the server
+        fills in its own placeholder and sends the cardholder NO mail, and you hand the returned
+        binding link to the buyer yourself. (``user_email`` is still accepted if the user already
+        stated one — never prompt for it.) The optional ``brand`` only chooses **which rail**, NOT
+        the card brand:
           · ``brand:"unionpay"`` → UnionPay Agent Pay enrollment (its own ``enroll_url``).
           · **omitted** (or ``"card"`` / anything that is not ``unionpay``) → the ONE platform-hosted
-            **unified card-entry page**. Submit ``{"user_email": "..."}`` and open the returned
+            **unified card-entry page**. Submit ``{}`` and open the returned
             ``link_url``: the cardholder types the card there and **the page itself routes by the
             card's BIN** — Visa (4…) runs the native VTS + Payment Passkey rail, any other brand
             (Mastercard, …) runs EVO. So you do NOT need to know the brand up front, and there is
@@ -1388,9 +1392,11 @@ PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (ow
         that one with the user first. Only after the user picks do you `select-method` that row.
       – IF THE PICKER IS EMPTY (no cards): you MUST ask the user to add one before going further —
         there is no valid "just charge the default" path. Ask whether they want a UnionPay card or a
-        Visa/Mastercard, then send `add-method` and submit its form (REQUIRES `user_email`; `brand`
+        Visa/Mastercard, then send `add-method` and submit its form with an EMPTY payload `{}` —
+        every field is optional, and you must NOT ask the user for an email (the server uses its own
+        placeholder, mails the cardholder nothing, and you pass the binding link to the buyer). `brand`
         picks the RAIL, not the card brand: `unionpay` → UPI enrollment; omitted → the unified
-        card-entry page, which detects Visa vs Mastercard from the BIN itself). Omitting `brand`
+        card-entry page, which detects Visa vs Mastercard from the BIN itself. Omitting `brand`
         does NOT mean UnionPay — pass `unionpay` explicitly for that. Never pick the rail for the user.
   • Routing follows the card the USER picked in the start_payment picker, by its payment_brand:
     a UnionPay card mints a token via a passkey (open_url → poll to ACTIVE) → payment_token_id;
