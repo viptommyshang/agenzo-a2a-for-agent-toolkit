@@ -24,7 +24,9 @@ like any other scenario (no code changes here):
     partial amount; a **confirm card** (``payment.refund-confirm``) requires the USER's explicit
     ``confirm`` before the refund is issued; ``payment.refund-result`` returns the outcome.
   - **create a network token** (``create-token`` scenario): mint a REUSABLE network token for a
-    bound card WITHOUT charging — pick a card, then it is minted by the CARD BRAND on ALL THREE
+    bound card WITHOUT charging — pick a card (or, when the user already named the card, pass its
+    ``payment_method_id`` to ``start_token_creation`` to skip the picker), then it is minted by the
+    CARD BRAND on ALL THREE
     rails: UnionPay (``open_url`` checkout passkey → poll to ACTIVE), Visa (``open_url`` payment_url
     FIDO passkey → poll to ACTIVE), or EVO/Mastercard (SYNCHRONOUS — no browser step). No charge
     and no ``charge_no`` occur; ``payment.token-result`` returns the ``payment_token_id`` (+ status).
@@ -440,9 +442,12 @@ _DEFAULT_TOKEN_ORCHESTRATION = (
     "`carries`.\n"
     "EXISTING CARD IS NO EXCEPTION: if you already have or just picked a bound card (this payload "
     "carries a payment_method_id), that is NOT a reason to charge it directly — the DEFAULT is STILL "
-    "to MINT a Network_Token FROM that SAME card. In stage 2 call start_token_creation and PICK THIS "
-    "SAME already-bound card in the create-token method list (no re-binding needed); then settle with "
-    "the minted payment_token_id. Skipping the bind step (card already exists) does NOT mean skipping "
+    "to MINT a Network_Token FROM that SAME card. In stage 2 call start_token_creation to mint from "
+    "that SAME already-bound card (no re-binding needed): when the user already named the card, pass "
+    "its id as start_token_creation(payment_method_id=<that card>) to SKIP the create-token picker "
+    "(the brand is resolved from the id); otherwise omit it and PICK that card in the create-token "
+    "method list. Either way then settle with the minted payment_token_id. Skipping the bind step "
+    "(card already exists) does NOT mean skipping "
     "the mint — the payment stays identical to a fresh-card booking, only the bind step is omitted.\n"
     "Only skip the token main path if the USER EXPLICITLY chose to charge their EVO card DIRECTLY "
     "instead of via a network token — then settle on the EVO rail WITH evo_explicit=true (see the "
@@ -882,7 +887,8 @@ _START_PAYMENT_TOKEN_REMINDER = (
     "default. If the user has NOT explicitly chosen an EVO card for a pay-per-call order, the DEFAULT "
     "main path is an INDEPENDENT Network_Token direct charge via start_token_creation: create-order "
     "(lock the order_id + authoritative amount) → start_token_creation(amount_cents=<that amount>, "
-    "order_id=<that order_id>, member_id=<same member>) → settle the money-action with the minted "
+    "order_id=<that order_id>, member_id=<same member>; add payment_method_id=<the card the user "
+    "named> to mint from that card and SKIP the picker) → settle the money-action with the minted "
     "payment_token_id (NOT payment_method_id). Only continue on THIS rail if the user explicitly picked "
     "an EVO card, or you are falling back after a token-path failure with the user's consent — and "
     "NEVER fall back to any platform / developer / member default card. If you DO settle via the EVO "
@@ -893,7 +899,11 @@ _START_PAYMENT_TOKEN_REMINDER = (
 
 @mcp.tool()
 async def start_payment(
-    amount_cents: int, recipient_name: str, recipient_account: str = "", member_id: str = ""
+    amount_cents: int,
+    recipient_name: str,
+    recipient_account: str = "",
+    member_id: str = "",
+    payment_method_id: str = "",
 ) -> dict[str, Any]:
     """MERCHANT-ORDER PRE-PAYMENT — EXPLICIT / FALLBACK EVO RAIL ONLY (not the pay-per-call default).
     Use this to pick a payment credential to attach to a booking ``confirm`` (hotel/flight/ride): it
@@ -973,13 +983,21 @@ async def start_payment(
 
     After you BIND a UnionPay card, mint its token BY PICKING IT: call ``start_payment`` again (or
     reuse this session), read ``payment.method-list``, and ``select-method`` the bound card (its row
-    ``carries`` ``payment_brand="unionpay"``, which drives the network-token mint). Do NOT pass
-    ``payment_method_id`` into the ``payment.setup`` submit — that skips the picker, leaves
-    ``payment_brand`` uncaptured, and the token is silently never minted.
+    ``carries`` ``payment_brand="unionpay"``, which drives the network-token mint). When the USER has
+    already named the exact card to use, you MAY instead pass its ``payment_method_id`` to this tool:
+    the orchestrator resolves the card's ``payment_brand`` from that id and SKIPS the
+    ``payment.method-list`` picker, routing straight on the card's rail (UnionPay mints the
+    network-token; EVO/Visa is handed back as the ``payment_method_id``) — in that case do NOT also
+    send a ``select-method``. Pass it ONLY for a card the user explicitly chose; leave it empty to let
+    the user pick (never a platform/member default). (Earlier builds required omitting it because the
+    picker was gated on the brand and a lone ``payment_method_id`` left ``payment_brand`` uncaptured;
+    the orchestrator now resolves the brand from the id, so a user-chosen id is safe to forward.)
 
     ``amount_cents`` = order total × 100. ``recipient_account`` (phone or email) is only needed for
     the UnionPay network-token branch; leave it empty for EVO. ``member_id`` (optional) must match
-    the booking's member."""
+    the booking's member. ``payment_method_id`` (optional) — the id of the card the USER explicitly
+    chose; forwarding it skips the picker (brand auto-resolved by the orchestrator). Leave empty to
+    show the picker; never pass a platform/member default."""
     bridge = _get_bridge()
     if member_id:
         await bridge.set_member(member_id)
@@ -996,15 +1014,23 @@ async def start_payment(
         status, raw = await bridge.send_text(_ctx(sid), "Prepare payment. Select payment method.")
         if status != 200:
             return _result(sid, status, raw)
+        setup_payload: dict[str, Any] = {
+            "amount_cents": int(amount_cents),
+            "recipient_name": recipient_name,
+            "recipient_account": recipient_account,
+        }
+        # When the USER has explicitly named the card, forward its payment_method_id: the
+        # orchestrator resolves payment_brand from the id and SKIPS the payment.method-list picker,
+        # routing straight on the card's rail (UnionPay mints a network-token; EVO/Visa hands the id
+        # back). In that case do NOT also drive a select-method. Set it ONLY for a user-chosen card —
+        # never a platform/member default; empty => the picker is shown and the user selects.
+        if payment_method_id:
+            setup_payload["payment_method_id"] = payment_method_id
         status, raw = await bridge.send_action(
             _ctx(sid),
             "payment.setup",
             "submit",
-            {
-                "amount_cents": int(amount_cents),
-                "recipient_name": recipient_name,
-                "recipient_account": recipient_account,
-            },
+            setup_payload,
         )
     except AuthError as exc:
         return {"session_id": sid, "error": f"auth failed: {exc}", "cards": [], "text": ""}
@@ -1023,6 +1049,7 @@ async def start_token_creation(
     recipient_account: str = "",
     member_id: str = "",
     order_id: str = "",
+    payment_method_id: str = "",
 ) -> dict[str, Any]:
     """Mint a REUSABLE Network_Token in an INDEPENDENT payment session (create-token scenario).
 
@@ -1058,6 +1085,13 @@ async def start_token_creation(
     ``recipient_name`` / ``recipient_account`` are the PAYER's own name + phone/email, needed ONLY for
     the UnionPay rail (leave empty for Visa/EVO; the flow re-collects them if a UnionPay card is
     picked). ``member_id`` (optional) MUST match the booking's member.
+
+    ``payment_method_id`` (optional) — pass it ONLY when the USER has already named the exact card to
+    mint from (e.g. "use payment method id pm_…"). The orchestrator then resolves that card's
+    ``payment_brand`` from the id and SKIPS the ``payment.method-list`` picker, minting straight on
+    the card's rail — so when you pass it, do NOT also drive a ``select-method``. This is NOT the
+    forbidden auto-select / default-card: it only forwards a card the USER explicitly chose. Leave it
+    empty when the user has not named a card — then the picker is shown and the user selects.
 
     ``order_id`` (optional) is the MERCHANT ORDER NUMBER (order_id) this token must be BOUND to —
     the ``order_id`` returned by the Booking_Session's create-order/lock step (e.g. hotel ``hho_…``,
@@ -1106,6 +1140,14 @@ async def start_token_creation(
         # Non-empty only (an order-less standalone token omits it and stays unbound).
         if order_id:
             submit_payload["external_transaction_id"] = order_id
+        # When the USER has explicitly named the card to mint from, forward its payment_method_id in
+        # the create-token entry submit: the orchestrator resolves the card's payment_brand from the
+        # id (lists the member's cards and matches by id) and SKIPS the payment.method-list picker,
+        # minting straight on that card's rail. Set it ONLY for a card the user explicitly chose —
+        # never a platform/member default; leave it empty to let the user pick from the method list
+        # (and then do NOT also drive a select-method — the id already stands in for the pick).
+        if payment_method_id:
+            submit_payload["payment_method_id"] = payment_method_id
         status, raw = await bridge.send_action(
             _ctx(sid),
             "payment.token-setup",
