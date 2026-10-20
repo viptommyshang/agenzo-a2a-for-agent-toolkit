@@ -434,9 +434,20 @@ _DEFAULT_TOKEN_ORCHESTRATION = (
     "  1) LOCK FIRST — complete create-order in THIS Booking_Session to obtain the order_id "
     "(hotel hho_… / flight ffo_… / ride rio_…) plus its Order_Authoritative_Amount/Currency.\n"
     "  2) MINT SECOND — in a SEPARATE Payment_Session call start_token_creation("
-    "amount_cents=<order authoritative amount>, order_id=<that order_id>, member_id=<same member>) "
-    "to mint the Network_Token; the minted token's frozen amount equals the order's authoritative "
-    "amount and its external_transaction_id equals the order_id (strict order↔token binding).\n"
+    "amount_cents=<order authoritative amount>, order_id=<that order_id>, member_id=<same member>, "
+    "provider_id=<the order's acquiring provider: hho_→redaug / ffo_→flink / rio_→elife, and "
+    "platform for a pg_… trip-cart aggregate>) to mint the Network_Token; the minted token's frozen "
+    "amount equals the order's authoritative amount and its external_transaction_id equals the "
+    "order_id (strict order↔token binding). provider_id decides which acquiring store the charge "
+    "lands in and is fixed onto the token at mint time; a payment bound to a platform merchant "
+    "order SHOULD declare it. Omitting it stays VALID and raises no error, but the charge then "
+    "lands on your default store — for an order payment that is usually the wrong store and you "
+    "are not told about it. When declared it is strictly checked: the wrong provider, or one with "
+    "no acquiring store enabled for you, is REFUSED at this mint step (HTTP 409 PROVIDER_MISMATCH "
+    "/ PROVIDER_NOT_CONFIGURED): no token is minted and no money moves; re-mint with the correct "
+    "value and a NEW Idempotency-Key, and never substitute another provider_id to get around "
+    "PROVIDER_NOT_CONFIGURED. Declare it ONCE, here — the settle in stage 3 reads it off the "
+    "token.\n"
     "  3) CHARGE — back in THIS Booking_Session, (re)send this settle action carrying the minted "
     "payment_token_id (NOT payment_method_id); choose the payment_token_id field per the action's "
     "`carries`.\n"
@@ -813,7 +824,21 @@ async def act(session_id: str, component: str, action: str, payload: dict[str, A
     NOT accept a payment credential), while the charge happens at ``pay`` on the resulting order card
     (``hotel.order-detail#pay`` / ``ride.order-awaiting#pay`` / ``flight.order-detail#pay``). Whichever
     action settles money MUST carry the payment method the USER explicitly chose — never omit it to
-    fall back to a platform/member default charge."""
+    fall back to a platform/member default charge.
+
+    ACQUIRING STORE ROUTING in the STANDALONE flows: the ENTRY cards of a standalone payment
+    (``payment.pay-setup#submit``) and of a standalone charge-by-token
+    (``payment.charge-token-setup#submit``) accept an optional ``provider_id`` in their payload — it
+    decides which acquiring store the charge lands in. These charges are bound to NO platform merchant
+    order, so the value is YOUR OWN declared identifier: it must be filed with the platform and
+    configured there before it works (an unconfigured value is refused with
+    ``PROVIDER_NOT_CONFIGURED``); leave the KEY OUT of the payload to land on your default store — an
+    empty string is a DECLARED-but-unconfigured value, not an omission, and gets the same refusal.
+    On ``charge-token`` it is only
+    a RESTATEMENT of what the token already declares — it must EQUAL the token's value or the charge is
+    refused with ``PROVIDER_MISMATCH``, and it never rewrites the token nor moves a token's charge to
+    another store. The REFUND entry card does NOT accept ``provider_id``: passing it has no effect,
+    because a refund always returns to the original charge's store."""
     bridge = _get_bridge()
     payload = payload or {}
     # 入口 form 卡的预填字段兜底：编排器已把抽取结果（如 list_statuses）预填进上一张 form 卡的 data，
@@ -1054,6 +1079,7 @@ async def start_token_creation(
     member_id: str = "",
     order_id: str = "",
     payment_method_id: str = "",
+    provider_id: str | None = None,
 ) -> dict[str, Any]:
     """Mint a REUSABLE Network_Token in an INDEPENDENT payment session (create-token scenario).
 
@@ -1105,15 +1131,61 @@ async def start_token_creation(
     a token minted for one order cannot be used to charge another (same-amount cross-order misuse is
     rejected). Leave it empty for a standalone, order-less token.
 
+    ``provider_id`` (optional) is the ACQUIRING PROVIDER that takes this payment — it decides which
+    acquiring STORE the charge lands in. You SHOULD declare it whenever this token is minted for a
+    platform merchant order (an ``order_id`` is passed): omitting it is still VALID and raises no
+    error, but the charge then lands on your DEFAULT store, which for an order payment is usually the
+    wrong store and is not reported back to you. When you DO declare it, it is strictly checked (see
+    below). The bridge forwards it as ``provider_id`` in the create-token
+    entry card's ``submit`` payload and the platform FIXES it onto the token document at mint time (it
+    also joins the mint idempotency fingerprint, so the same Idempotency-Key with a DIFFERENT
+    ``provider_id`` is an ``IDEMPOTENCY_CONFLICT``, never a silent replay of the first token). You
+    declare the PROVIDER identifier — never a store number; stores are platform-side configuration and
+    appear in no request, no card and no response. Values (matched as exact lowercase, no case folding,
+    no alias guessing):
+      · ``redaug``   — hotel orders (order ids ``hho_…``)
+      · ``flink``    — flight orders (order ids ``ffo_…``)
+      · ``elife``    — ride orders (order ids ``rio_…``)
+      · ``platform`` — trip aggregate payment: ONE charge clearing a whole cart of locked orders
+                       (payment-group ids ``pg_…``, see the TRIP AGGREGATE section below)
+      · YOUR OWN declared identifier — for a STANDALONE payment / standalone charge-by-token that is
+        bound to NO platform merchant order. The value is yours to choose (lowercase, stable, no
+        spaces), but you MUST FILE IT WITH THE PLATFORM FIRST: it only takes effect once the platform
+        has configured an acquiring store for it. Which values you may actually use is told to you by
+        the platform at integration time. Do NOT borrow a platform provider's value (``redaug`` /
+        ``flink`` / ``elife``) for an order-less charge — it would land in that provider's store and be
+        indistinguishable from their order money afterwards.
+    OMITTING THE ARGUMENT ENTIRELY IS VALID: the charge then lands on the DEFAULT store the platform
+    configured for you and no new error is raised. But do NOT pass an EMPTY or whitespace-only string
+    to mean "no declaration" — OMITTING the argument and DECLARING ``""`` are two different things:
+    the empty string is forwarded verbatim as a declared-but-invalid value and the platform refuses the
+    mint with ``PROVIDER_NOT_CONFIGURED`` (it never silently falls back to the default store, because
+    that would land the money in the wrong acquiring account with nothing to notice it by). When you
+    have no provider to declare, leave the argument out.
+    A WRONG value is a REFUSAL, not a mis-routed store: when the
+    declared provider contradicts the acquiring provider the ``order_id`` prefix points at, THE MINT
+    ITSELF is refused with ``PROVIDER_MISMATCH`` (HTTP 409) — no token is minted and no money moves;
+    re-mint with the correct value and a NEW Idempotency-Key. A value that has no acquiring store
+    configured for this caller is refused with ``PROVIDER_NOT_CONFIGURED`` (HTTP 409) and the platform
+    does NOT fall back to the default store — do NOT substitute another ``provider_id`` to get around
+    it; ask the platform to enable it. DECLARE IT ONCE: a token-based payment declares it HERE, at mint
+    time, and the domain ``pay``, the trip aggregate settlement and the standalone charge-by-token
+    (``payment.charge-token-setup``) all READ it off the token — restating it there is only checked
+    against the token, it never rewrites it.
+
     TRIP AGGREGATE — bind to the PAYMENT GROUP, not a single order. When paying a whole trip cart in
     ONE aggregate charge (the trip cart-summary checkout), pass ``order_id`` = the payment-group id
     (a ``pg_…`` value shown on that cart-summary card), and ``amount_cents`` = the AGGREGATE TOTAL ×
     100 (the cart's total, i.e. the sum of all the locked sub-orders — NOT any single sub-order's
     amount). The bridge forwards that ``pg_…`` as the token's ``external_transaction_id``; the
     platform's batch settlement then charges the ONE aggregate token against the payment group (its
-    binding accepts the payment-group id), covering every sub-order at once. EVO/Mastercard mints this
-    aggregate token SYNCHRONOUSLY (no passkey). See ``guide()``'s TRIP AGGREGATE PAYMENT section for
-    the full mint→checkout→confirm→settle order."""
+    binding accepts the payment-group id), covering every sub-order at once. An aggregate token MUST
+    declare ``provider_id="platform"``: one charge can only land in ONE acquiring store, so the whole
+    cart clears through the platform's aggregate store and is NOT split by the sub-orders' acquiring
+    providers — declaring a single provider (e.g. ``redaug``) is refused with ``PROVIDER_MISMATCH``.
+    If each provider must clear into its own store, do not aggregate: lock, mint and pay the orders
+    one by one. EVO/Mastercard mints this aggregate token SYNCHRONOUSLY (no passkey). See
+    ``guide()``'s TRIP AGGREGATE PAYMENT section for the full mint→checkout→confirm→settle order."""
     bridge = _get_bridge()
     if member_id:
         await bridge.set_member(member_id)
@@ -1152,6 +1224,17 @@ async def start_token_creation(
         # (and then do NOT also drive a select-method — the id already stands in for the pick).
         if payment_method_id:
             submit_payload["payment_method_id"] = payment_method_id
+        # 收单门店按供应商路由（契约 §9.5）：声明值原样进 create-token 入口卡的 submit payload，平台据它
+        # 把本次付款落到对应收单门店并固化到令牌上。只声明一次——之后业务域 pay / 聚合结算 / 按令牌扣款
+        # 都从令牌读，不重复声明。
+        # 判据是 `is not None`（**不是**真值判断）：契约 §9.5 把「整个字段省略」与「声明了未配置的取值」
+        # 定为两件事——省略落默认门店，声明了无效取值一律拒付、绝不回落默认门店。所以空串 / 纯空白属
+        # 「已声明但无效」，必须原样上送、由平台 fail-closed 返回 409 PROVIDER_NOT_CONFIGURED；在这一层
+        # 把它折叠成「省略」会让调用方的拼装 bug 静默落到默认门店（钱落错收单主体且事后无从发现）。
+        # 入参默认值因此用 None 而非 ""：只有这样才能区分「没传」与「传了空串」。与 agenzo-cli 的
+        # --provider-id（flag 出现即上送、空串原样转发）同口径。
+        if provider_id is not None:
+            submit_payload["provider_id"] = provider_id
         status, raw = await bridge.send_action(
             _ctx(sid),
             "payment.token-setup",
@@ -1350,9 +1433,26 @@ PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (ow
          ride rio_…) AND its authoritative amount/currency BEFORE minting.
       2) MINT SECOND — in a SEPARATE Payment_Session call start_token_creation(
          amount_cents=<that authoritative amount>, order_id=<that order_id>,
-         member_id=<the SAME member_id as the booking>) to mint the Network_Token. The token's
+         member_id=<the SAME member_id as the booking>,
+         provider_id=<that order's acquiring provider: hho_ → redaug, ffo_ → flink, rio_ → elife;
+         platform for a pg_… trip-cart aggregate>) to mint the Network_Token. The token's
          frozen amount equals the order's authoritative amount; passing order_id sets the token's
-         external_transaction_id = order_id (STRICT order binding).
+         external_transaction_id = order_id (STRICT order binding). ACQUIRING STORE ROUTING —
+         provider_id decides which acquiring store this charge lands in and is fixed onto the token
+         at mint time; declare it ONCE here (the settle in stage 3 reads it off the token). A
+         payment bound to a platform merchant order SHOULD declare it — omitting it is VALID and
+         raises no error, but the charge lands on your default store, which for an order payment is
+         usually the wrong store and is not reported back to you. A DECLARED value is strictly
+         checked: one that contradicts the
+         order's acquiring provider is refused right here with PROVIDER_MISMATCH (409), and a value
+         with no acquiring store enabled for you with PROVIDER_NOT_CONFIGURED (409) — in both cases
+         NO token is minted and NO money moves. Re-mint with the correct value and a NEW
+         Idempotency-Key; never swap in a different provider_id to get around
+         PROVIDER_NOT_CONFIGURED (ask the platform to enable it). For a STANDALONE, order-less
+         payment use YOUR OWN identifier — it must be filed with the platform and configured before
+         it works. OMIT the argument entirely to land on your default store — never pass an empty
+         string for that: "" counts as a DECLARED-but-unconfigured value and is refused with
+         PROVIDER_NOT_CONFIGURED.
       3) CHARGE — back in the Booking session, settle the money-action carrying the minted
          payment_token_id (NOT payment_method_id); read the action's `carries` for the field name.
     Three hard rules bind this path: (1) LOCK FIRST, MINT SECOND — mint for the exact locked amount
@@ -1441,9 +1541,15 @@ TRIP AGGREGATE PAYMENT — settle a whole cart of locked orders in ONE charge (t
       1) From the cart-summary card read the payment-group id (pg_…) and the cart total + currency.
       2) In a SEPARATE payment session mint the aggregate token bound to the GROUP:
          start_token_creation(amount_cents=<cart TOTAL × 100 — the whole cart, not a single order>,
-         order_id=<the pg_… payment-group id>, member_id=<the SAME member_id as the trip>). Pick a
-         bound card when the create-token picker lists them (Mastercard/EVO mints SYNCHRONOUSLY, no
-         passkey; UnionPay/Visa use a passkey → poll to ACTIVE). This yields ONE payment_token_id
+         order_id=<the pg_… payment-group id>, member_id=<the SAME member_id as the trip>,
+         provider_id="platform"). An aggregate token MUST declare provider_id="platform": ONE charge
+         can only land in ONE acquiring store, so the whole cart clears through the platform's
+         aggregate store and is NOT split by the sub-orders' acquiring providers — declaring a single
+         provider (e.g. redaug) is refused with PROVIDER_MISMATCH. If each provider must clear into
+         its own store, do not aggregate: lock, mint and pay the orders one by one.
+         Pick a bound card when the create-token picker lists them (Mastercard/EVO mints
+         SYNCHRONOUSLY, no passkey; UnionPay/Visa use a passkey → poll to ACTIVE).
+         This yields ONE payment_token_id
          whose frozen amount = the cart total and whose external_transaction_id = the payment-group id.
       3) Back in the TRIP session, send the cart-summary's checkout action CARRYING that
          payment_token_id (the action's `carries` names the field). Supplying the token here goes
