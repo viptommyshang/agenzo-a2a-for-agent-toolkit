@@ -234,6 +234,11 @@ def _result(session_id: str, status: int, raw: str) -> dict[str, Any]:
         out = normalize_task(task, heavy_keys=frozenset())
     out["session_id"] = session_id
     out["member_id"] = _get_bridge().member_id
+    # flow_id —— 这一次用户任务的关联键，跨订单会话与支付会话、跨所有服务（含异步记账）都是
+    # 同一个值。放进每次工具返回，调用方排障时可以直接报出来，不必去翻日志反推。
+    flow_id = _get_bridge().flow_id
+    if flow_id:
+        out["flow_id"] = flow_id
     # 记下本轮卡片声明的动作 carries，供下一次 act 按声明判定结算动作（见 _remember_card_actions）。
     _remember_card_actions(session_id, out)
     return out
@@ -772,6 +777,9 @@ async def book(request: str, member_id: str = "") -> dict[str, Any]:
     bridge = _get_bridge()
     if member_id:
         await bridge.set_member(member_id)
+    # 新任务 → 铸一个新 flow_id。本工具的语义就是「开一段新会话」，所以强制换新：复用的话，
+    # 同一个进程里先后办的两件事会被并进同一条旅程，按 flow_id 查会捞出不相干的订单。
+    bridge.start_new_flow()
     sid = _new_session("booking")
     try:
         status, raw = await bridge.send_text(_ctx(sid), request)
@@ -1030,6 +1038,9 @@ async def start_payment(
     bridge = _get_bridge()
     if member_id:
         await bridge.set_member(member_id)
+    # 沿用当前任务的 flow_id（没有才铸）：这是一个**独立的** Payment_Session，但属于同一次
+    # 用户任务——这正是 flow_id 存在的理由，session_id 在这里必然换一个、串不起来。
+    bridge.ensure_flow()
     sid = _new_session("payment")
     try:
         # Brand-neutral routing seed. The orchestrator classifies intent by *literal substring*
@@ -1189,6 +1200,9 @@ async def start_token_creation(
     bridge = _get_bridge()
     if member_id:
         await bridge.set_member(member_id)
+    # 同上：铸 Network Token 走独立 Payment_Session，但属于同一次用户任务，沿用 flow_id。
+    # 订单会话与这个支付会话带同一个 flow_id，是「一笔订单查全链路」能成立的关键一环。
+    bridge.ensure_flow()
     sid = _new_session("payment")
     try:
         # Brand-neutral routing seed for the create-token scenario. The orchestrator classifies

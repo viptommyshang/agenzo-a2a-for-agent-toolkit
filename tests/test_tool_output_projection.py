@@ -384,6 +384,9 @@ class FakeBridge:
         self.action_calls: list[tuple[str, str, str, dict]] = []
         self._text_responses: deque[tuple[int, str]] = deque()
         self._action_responses: deque[tuple[int, str]] = deque()
+        # flow_id（业务旅程关联键）：真实 bridge 在 book() 铸新、在支付入口沿用，
+        # server._result() 也会把它放进返回值，故替身要同形。
+        self._flow_id: str | None = None
 
     @property
     def member_id(self) -> str:
@@ -392,6 +395,20 @@ class FakeBridge:
     async def set_member(self, member_id: str) -> None:
         if (member_id or "").strip():
             self._member_id = member_id.strip()
+
+    # ── flow_id：与真实 A2ABridge 同形 ──────────────────────────────────────────
+    @property
+    def flow_id(self) -> str | None:
+        return self._flow_id
+
+    def start_new_flow(self) -> str:
+        self._flow_id = "flw_" + "0" * 32
+        return self._flow_id
+
+    def ensure_flow(self) -> str:
+        if not self._flow_id:
+            self.start_new_flow()
+        return self._flow_id  # type: ignore[return-value]
 
     def queue_text_response(self, status: int, raw: str) -> None:
         self._text_responses.append((status, raw))

@@ -21,6 +21,12 @@ from uuid import uuid4
 
 import httpx
 
+from agenzo_a2a_for_agent_toolkit.flow import (
+    BAGGAGE_HEADER,
+    build_baggage,
+    new_flow_id,
+)
+
 logger = logging.getLogger("agenzo_a2a")
 
 
@@ -416,6 +422,8 @@ def exchange_view(record: dict[str, Any], *, maxlen: int = 0) -> dict[str, Any]:
         "method": record.get("method"),
         "url": record.get("url"),
         "context_id": record.get("context_id"),
+        # 跨服务查全链路就用这个键：trace 只覆盖一个轮次，context_id 只覆盖一个会话。
+        "flow_id": record.get("flow_id"),
         "status": record.get("status"),
         "request": record.get("request"),
         "response_raw": _cap(raw, maxlen),
@@ -444,6 +452,10 @@ class A2ABridge:
         self._token: str | None = None
         self._member_id: str = cfg.MEMBER_ID
         self._lock = asyncio.Lock()
+        # flow_id —— 当前这一次用户任务的关联键（见 flow.py）。本桥是唯一知道「订单会话与
+        # 支付会话属于同一次任务」的角色（支付会话是它代为开的），所以它在这里铸造一次，
+        # 并在两个会话上带同一个值。
+        self._flow_id: str | None = None
         # Raw-exchange capture (for inspect() / debug output). Bounded ring buffer; each turn's
         # exact request body + response text is recorded here so integrators can see the real A2A
         # protocol that the normalized tool output hides.
@@ -475,6 +487,9 @@ class A2ABridge:
             "method": method,
             "url": url,
             "context_id": _context_of(request_body),
+            # 记下本次交换所属的任务，这样 inspect() 不用翻服务器日志就能回答「这笔的
+            # flow_id 是什么」——它是跨服务查全链路的那个键。
+            "flow_id": self._flow_id,
             "request": request_body,
             "status": status,
             # Cap stored response to bound memory; exposure re-caps as needed.
@@ -516,6 +531,31 @@ class A2ABridge:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    @property
+    def flow_id(self) -> str | None:
+        """当前任务的 ``flow_id``（还没开始任何任务时为 ``None``）。"""
+        return self._flow_id
+
+    def start_new_flow(self) -> str:
+        """开启一次**新**任务：铸一个新 ``flow_id`` 并设为当前值。
+
+        由 ``book()`` 调用——它的语义就是「开一段新的会话」。强制换新而不是复用，否则同一
+        个进程里先后办的两件事会被并进同一条旅程，按 flow_id 查会捞出不相干的订单。
+        """
+        self._flow_id = new_flow_id()
+        return self._flow_id
+
+    def ensure_flow(self) -> str:
+        """返回当前 ``flow_id``，没有则铸一个。
+
+        由支付类入口（``start_payment`` / ``start_token_creation``）调用：它们开的是**同一次
+        任务**里的独立支付会话，必须沿用当前值——这正是 flow_id 存在的理由。仅当调用方没先
+        ``book()`` 就直接开支付（如独立收款、单独铸 token）时才铸新的。
+        """
+        if not self._flow_id:
+            self._flow_id = new_flow_id()
+        return self._flow_id
 
     @property
     def member_id(self) -> str:
@@ -612,8 +652,21 @@ class A2ABridge:
             return self._token
 
     # ── driving turns (with a single 401 re-auth retry) ───────────────────────
+    def _context_headers(self) -> dict[str, str]:
+        """本次任务要带给下游的关联头（当前只有 ``baggage`` 里的 ``flow_id``）。
+
+        一处构造、各出站点复用，避免「A2A 带了、工具端点忘了带」这类逐点遗漏。没有
+        flow_id 时返回空字典，调用方可以无条件 ``headers.update(...)``。
+        """
+        baggage = build_baggage(self._flow_id)
+        return {BAGGAGE_HEADER: baggage} if baggage else {}
+
     async def _raw_post(self, body: dict[str, Any], token: str) -> tuple[int, str]:
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            **self._context_headers(),
+        }
         base, agent = self.cfg.BASE_URL, self.cfg.AGENT_ID
         if self.cfg.STREAM:
             url = f"{base}/a2a/agents/{agent}/v1/message:stream"
@@ -656,7 +709,11 @@ class A2ABridge:
         self, path: str, payload: dict[str, Any], token: str
     ) -> tuple[int, str]:
         url = f"{self.cfg.BASE_URL}{path}"
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            **self._context_headers(),
+        }
         resp = await self._client.post(url, json=payload, headers=headers)
         self._record(
             kind="tool", transport="http", method="POST", url=url,
