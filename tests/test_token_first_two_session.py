@@ -69,6 +69,10 @@ class FakeBridge:
         self.set_member_calls: list[str] = []
         self._text_responses: deque[tuple[int, str]] = deque()
         self._action_responses: deque[tuple[int, str]] = deque()
+        # flow_id（业务旅程关联键）：真实 bridge 在 book() 铸新、在支付入口沿用，使订单会话与
+        # 独立支付会话带同一个值。替身记下每次调用，供「两个会话共享同一条旅程」的断言。
+        self._flow_id: str | None = None
+        self.flow_calls: list[str] = []  # "start_new" / "ensure"
 
     # server._result() 读取 bridge.member_id 填充返回值
     @property
@@ -80,6 +84,24 @@ class FakeBridge:
         self.set_member_calls.append(member_id)
         if member_id:
             self._member_id = member_id
+
+    # ── flow_id：与真实 A2ABridge 同形（server._result / 入口工具都会用到）──────────
+    @property
+    def flow_id(self) -> str | None:
+        return self._flow_id
+
+    def start_new_flow(self) -> str:
+        """对应真实 bridge：开启一次新任务，强制换新 flow_id。"""
+        self.flow_calls.append("start_new")
+        self._flow_id = f"flw_{len(self.flow_calls):032d}"
+        return self._flow_id
+
+    def ensure_flow(self) -> str:
+        """对应真实 bridge：沿用当前 flow_id，没有才铸。"""
+        self.flow_calls.append("ensure")
+        if not self._flow_id:
+            self._flow_id = f"flw_{len(self.flow_calls):032d}"
+        return self._flow_id
 
     def queue_text_response(self, status: int, raw: str) -> None:
         self._text_responses.append((status, raw))
@@ -233,3 +255,59 @@ class TokenFirstTwoSessionTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class FlowIdSpansBothSessionsTest(unittest.IsolatedAsyncioTestCase):
+    """``flow_id`` 跨「订单会话 + 独立支付会话」保持同一个值（端到端，经真实工具入口）。
+
+    这是 flow_id 存在的根本理由：两个会话的 ``session_id`` **必然不同**（支付会话刻意隔离，
+    以免铸币把订单的 ``flow_state`` 冲掉），而 ``trace_id`` 每个对话轮次换一次。于是查「一笔
+    订单的全链路」时，这两个 id 都串不起来——只有 flow_id 能。
+
+    判据放在工具入口这一层而不是 bridge 上：真正容易写错的是「哪个入口该铸新、哪个该沿用」。
+    """
+
+    def setUp(self) -> None:
+        self._orig_bridge = server._bridge
+        self._orig_sessions = dict(server._sessions)
+        server._sessions.clear()
+        self.fake = FakeBridge(member_id="m-config-default")
+        server._bridge = self.fake
+
+    def tearDown(self) -> None:
+        server._bridge = self._orig_bridge
+        server._sessions.clear()
+        server._sessions.update(self._orig_sessions)
+
+    async def test_booking_and_token_session_share_one_flow_id(self) -> None:
+        booking = await server.book("book a hotel near Orchard Road", member_id="m-shared")
+        token = await server.start_token_creation(
+            amount_cents=14731, order_id="hho_FLOW1", member_id="m-shared"
+        )
+
+        # 会话不同、旅程相同 —— 这一条就是整个方案要成立的那个不变量。
+        self.assertNotEqual(booking["session_id"], token["session_id"])
+        self.assertEqual(booking["flow_id"], token["flow_id"])
+        # book 铸新、支付入口沿用（顺序与语义都要对）。
+        self.assertEqual(self.fake.flow_calls, ["start_new", "ensure"])
+
+    async def test_start_payment_also_reuses_the_flow(self) -> None:
+        """显式 / 回退的 EVO 轨同样沿用，不另起一条旅程。"""
+        booking = await server.book("book a hotel", member_id="m-shared")
+        payment = await server.start_payment(
+            amount_cents=14731, recipient_name="Kevin Zhang", member_id="m-shared"
+        )
+
+        self.assertEqual(booking["flow_id"], payment["flow_id"])
+        self.assertEqual(self.fake.flow_calls, ["start_new", "ensure"])
+
+    async def test_a_second_booking_starts_a_new_flow(self) -> None:
+        """两次 ``book()`` 是两件事，不能并进同一条旅程。
+
+        否则按 flow_id 查会把不相干的订单一起捞出来。
+        """
+        first = await server.book("book a hotel", member_id="m-shared")
+        second = await server.book("book a flight", member_id="m-shared")
+
+        self.assertNotEqual(first["flow_id"], second["flow_id"])
+        self.assertEqual(self.fake.flow_calls, ["start_new", "start_new"])
