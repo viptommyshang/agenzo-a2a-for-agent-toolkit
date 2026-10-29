@@ -840,11 +840,14 @@ async def act(session_id: str, component: str, action: str, payload: dict[str, A
     decides which acquiring store the charge lands in. These charges are bound to NO platform merchant
     order, so the value is YOUR OWN declared identifier: it must be filed with the platform and
     configured there before it works (an unconfigured value is refused with
-    ``PROVIDER_NOT_CONFIGURED``); leave the KEY OUT of the payload to land on your default store — an
-    empty string is a DECLARED-but-unconfigured value, not an omission, and gets the same refusal.
+    ``PROVIDER_NOT_CONFIGURED``). The value is matched CASE-INSENSITIVELY (the platform folds it to
+    lower case), so you need not normalise the case yourself. Leave the KEY OUT of the payload to land
+    on your default store — an empty string is a DECLARED-but-unconfigured value, not an omission, and
+    gets the same refusal (whitespace is NOT trimmed, so a blank value never reads as an omission).
     On ``charge-token`` it is only
-    a RESTATEMENT of what the token already declares — it must EQUAL the token's value or the charge is
-    refused with ``PROVIDER_MISMATCH``, and it never rewrites the token nor moves a token's charge to
+    a RESTATEMENT of what the token already declares — it must EQUAL the token's value, compared
+    CASE-INSENSITIVELY (restating ``REDAUG`` against a ``redaug`` token is consistent), or the charge
+    is refused with ``PROVIDER_MISMATCH``; it never rewrites the token nor moves a token's charge to
     another store. The REFUND entry card does NOT accept ``provider_id``: passing it has no effect,
     because a refund always returns to the original charge's store."""
     bridge = _get_bridge()
@@ -1148,20 +1151,24 @@ async def start_token_creation(
     error, but the charge then lands on your DEFAULT store, which for an order payment is usually the
     wrong store and is not reported back to you. When you DO declare it, it is strictly checked (see
     below). The bridge forwards it as ``provider_id`` in the create-token
-    entry card's ``submit`` payload and the platform FIXES it onto the token document at mint time (it
-    also joins the mint idempotency fingerprint, so the same Idempotency-Key with a DIFFERENT
-    ``provider_id`` is an ``IDEMPOTENCY_CONFLICT``, never a silent replay of the first token). You
+    entry card's ``submit`` payload and the platform FIXES the FOLDED (lower-case) value onto the token
+    document at mint time (it also joins the mint idempotency fingerprint — in its folded form, so
+    reusing an Idempotency-Key with a different CASE of the same value replays the first token, while
+    reusing it with ANOTHER provider is an ``IDEMPOTENCY_CONFLICT`` and never a silent replay). You
     declare the PROVIDER identifier — never a store number; stores are platform-side configuration and
-    appear in no request, no card and no response. Values (matched as exact lowercase, no case folding,
-    no alias guessing):
+    appear in no request, no card and no response. Values (CASE-INSENSITIVE: the platform folds the
+    value to lower case before matching, so ``REDAUG`` / ``Redaug`` / ``redaug`` are the same
+    declaration — but no alias guessing, the folded value must still be one the platform has
+    configured for you):
       · ``redaug``   — hotel orders (order ids ``hho_…``)
       · ``flink``    — flight orders (order ids ``ffo_…``)
       · ``elife``    — ride orders (order ids ``rio_…``)
       · ``platform`` — trip aggregate payment: ONE charge clearing a whole cart of locked orders
                        (payment-group ids ``pg_…``, see the TRIP AGGREGATE section below)
       · YOUR OWN declared identifier — for a STANDALONE payment / standalone charge-by-token that is
-        bound to NO platform merchant order. The value is yours to choose (lowercase, stable, no
-        spaces), but you MUST FILE IT WITH THE PLATFORM FIRST: it only takes effect once the platform
+        bound to NO platform merchant order. The value is yours to choose (stable, no spaces; case
+        does not matter, the platform stores it folded), but you MUST FILE IT WITH THE PLATFORM
+        FIRST: it only takes effect once the platform
         has configured an acquiring store for it. Which values you may actually use is told to you by
         the platform at integration time. Do NOT borrow a platform provider's value (``redaug`` /
         ``flink`` / ``elife``) for an order-less charge — it would land in that provider's store and be
