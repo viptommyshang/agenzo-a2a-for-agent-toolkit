@@ -39,10 +39,13 @@ user and only send ``confirm`` after they approve. Drive the whole sub-flow with
 
 Tools
 -----
-- ``discover()``            – agent card (which domains/skills are bookable).
+- ``discover()``            – agent card (which domains/skills are available: bookable + lookupable).
 - ``configure(...)``        – override orchestrator connection settings at runtime.
 - ``guide()``              – domain-agnostic driving law + LIVE domains/scenarios (from the card).
-- ``book(request)``        – start a booking conversation from natural language; returns a session.
+- ``book(request)``        – start a TRANSACTION from natural language (order / card / payment).
+- ``lookup(request)``      – READ-ONLY information lookup from natural language (prices, market data,
+                             web & news search, social, SEO, research). Questions go here, not to
+                             ``book``; some lookups are billed per call.
 - ``send_message(sid,txt)``– natural-language turn (answer a server follow-up).
 - ``act(sid,comp,action,payload)`` – structured card action (the main driver).
 - ``poll(sid,comp)``       – re-check an ``*-await`` card (``action:"poll"``).
@@ -641,9 +644,16 @@ def _attach_token_path_failure(
 # ─────────────────────────────────────────────────────────────────────────────
 @mcp.tool()
 async def discover() -> dict[str, Any]:
-    """Return the orchestrator agent card: name, description (bookable domains + required client
+    """Return the orchestrator agent card: name, description (available domains + required client
     capabilities), input/output modes, and the discovery skill catalogue. Call this first to learn
-    what can be booked (e.g. hotel, flight)."""
+    what this agent can actually do — the catalogue is generated live from the orchestrator's
+    schemas, so it covers both **transactions** (hotel, flight, ride, card management, payments —
+    drive with ``book``) and **read-only information lookups** (prices, market data, web and news
+    search, social, SEO, research — drive with ``lookup``).
+
+    Call this BEFORE concluding that a request is out of scope: the domain list is schema-driven and
+    grows without this bridge's tool descriptions changing, so the card is the only authoritative
+    answer to "can this agent do X?"."""
     bridge = _get_bridge()
     try:
         card = await bridge.agent_card()
@@ -753,6 +763,10 @@ async def book(request: str, member_id: str = "") -> dict[str, Any]:
     """Start a NEW booking conversation from a natural-language request and return the first
     card(s).
 
+    This is the TRANSACTION entry point: orders (hotel / flight / ride), card management, and
+    standalone payments. For a factual QUESTION — prices, market data, web & news search, social,
+    SEO, research — use ``lookup(...)`` instead; it is read-only and never creates anything.
+
     IMPORTANT — pass the user's request VERBATIM and COMPLETE. Do NOT summarize or trim it: keep
     every detail the user stated, especially the traveler/guest NAME, PHONE and EMAIL. The server
     prefills the entry form by extracting fields from exactly this text, so dropping the name/phone
@@ -781,6 +795,67 @@ async def book(request: str, member_id: str = "") -> dict[str, Any]:
     # 同一个进程里先后办的两件事会被并进同一条旅程，按 flow_id 查会捞出不相干的订单。
     bridge.start_new_flow()
     sid = _new_session("booking")
+    try:
+        status, raw = await bridge.send_text(_ctx(sid), request)
+    except AuthError as exc:
+        return {"session_id": sid, "error": f"auth failed: {exc}", "cards": [], "text": ""}
+    return _result(sid, status, raw)
+
+
+@mcp.tool()
+async def lookup(request: str, member_id: str = "") -> dict[str, Any]:
+    """**READ-ONLY INFORMATION LOOKUP** — ask a factual question in natural language and get data back.
+
+    This is the entry point for *questions*, as opposed to ``book(...)`` which starts *transactions*
+    (orders, card management, payments). Use it whenever the user wants to KNOW something rather than
+    BUY or ARRANGE something:
+
+      - prices & markets — "what's the bitcoin price in USD", "Tesla's revenue last year";
+      - web & news search — "latest domestic news", "search the web for X";
+      - social, SEO & search data — follower counts, keyword rankings, backlinks;
+      - research & company/people lookups — papers, patents, funding, company profiles;
+      - "what data can you look up?" — lists the available categories (free, no upstream call).
+
+    Not sure whether a request is a lookup or a transaction? ``discover()`` returns the live domain
+    list. A rule of thumb: if answering it would create or change nothing, it belongs here.
+
+    **Billing — no confirmation card, but the spend has exactly one entry point.** This domain
+    declares no confirmation step, so nothing ever pauses asking "are you sure" the way a settle
+    action under ``book`` does. What it has instead is a structural gate: the only billed step is
+    the final data fetch, and it can **only** be driven from the ``data.capability-detail`` card's
+    ``run-query`` action. You therefore always pass through that card — which carries the
+    capability's ``price_usd`` and ``cost_tier`` — *before* anything is charged. Read those fields
+    there; that card is where you decide whether to spend.
+
+    Getting to it is free: listing categories, searching for a capability, and reading its
+    parameter spec never touch a paid call. A single fetch is typically well under a cent, so the
+    usual judgement is "just answer the question". **Ask the user first** when they have signalled
+    they care about cost, when the card shows no ``price_usd`` (``cost_tier: variable`` — the cost
+    is not knowable in advance), or when you are about to run several fetches in a row.
+
+    **Strictly read-only**: results are returned to you and nothing else. They never enter an order,
+    payment or settlement flow, and this tool can neither create nor modify anything.
+
+    Returns the same envelope as ``book`` — ``{session_id, cards, text, state, primary_component,
+    member_id}`` — and like ``book``, **this domain is card-driven**. Read the last card's
+    ``component`` / ``data`` / ``actions`` and advance with ``act(session_id, ...)``. The usual
+    sequence is: entry card ``data.lookup`` (give it an ENGLISH ``keyword`` — the capability
+    catalogue is English-only, a Chinese keyword matches nothing) → ``data.capability-list``
+    (``view-spec`` on the one that fits) → ``data.capability-detail`` (check the price, then
+    ``run-query``) → ``data.query-result``, which is terminal and carries ``cost_usd`` plus the
+    data. ``text`` is a flattened human-readable rendering of the same turn — a fallback for
+    text-only callers, not the place to read structured values from. To change course or ask a
+    follow-up in words, send another message into the SAME session with
+    ``send_message(session_id, ...)`` — that keeps the context instead of starting over."""
+    bridge = _get_bridge()
+    if member_id:
+        await bridge.set_member(member_id)
+    # ``ensure_flow`` 而**不是** ``start_new_flow``：一次查询是**旁路**，不是一段新旅程。用户在订酒店
+    # 途中顺口问一句汇率，若在这里换掉 flow_id，那笔订单后续步骤就跟它前面的步骤断在两条旅程上，
+    # 「按 flow_id 查一笔订单的全链路」当场失效。没有进行中的旅程时 ensure_flow 自己会铸一个。
+    # 会话本身仍然独立（新 context_id），所以订单会话的 flow_state 不被这次查询干扰。
+    bridge.ensure_flow()
+    sid = _new_session("lookup")
     try:
         status, raw = await bridge.send_text(_ctx(sid), request)
     except AuthError as exc:
@@ -1636,24 +1711,26 @@ def _render_scenario_catalog(card: dict[str, Any]) -> str:
 
 @mcp.tool()
 async def guide() -> str:
-    """Return the domain-agnostic driving law PLUS a LIVE catalog of bookable domains/scenarios.
+    """Return the domain-agnostic driving law PLUS a LIVE catalog of available domains/scenarios.
 
     The step-by-step logic no longer hardcodes per-domain component/action/field names (those come
     from each card the orchestrator returns — read `actions[].id` and `actions[].carries`). The
     catalog is generated from the orchestrator's schema-driven agent card, so it tracks new/renamed
-    domains and scenarios automatically. Read this once when you start driving a booking."""
+    domains and scenarios automatically — it covers the transactional domains (hotel / flight /
+    ride / payment, entered via ``book``) as well as read-only information lookups (entered via
+    ``lookup``). Read this once when you start driving any task."""
     parts = [_GUIDE_GENERIC]
     bridge = _get_bridge()
     try:
         card = await bridge.agent_card()
     except Exception as exc:  # noqa: BLE001 — guide must work even if the orchestrator is down
         parts.append(
-            "Bookable domains & scenarios: could not reach the orchestrator's agent card "
+            "Available domains & scenarios: could not reach the orchestrator's agent card "
             f"({exc}). Call discover() once it is up to list them."
         )
         return "\n".join(parts)
 
-    parts.append("Bookable domains & scenarios (LIVE from the orchestrator's agent card)")
+    parts.append("Available domains & scenarios (LIVE from the orchestrator's agent card)")
     parts.append("=" * 70)
     desc = card.get("description")
     if isinstance(desc, str) and desc.strip():
@@ -1717,5 +1794,216 @@ def main() -> None:
         mcp.run()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 只读信息查询的**细粒度**工具（lookup_* 四件套）
+#
+# 为什么在 ``lookup`` 之外再开四个工具：``lookup`` 把"问一句 → 服务端自己把三步走完 → 回一段
+# 文本"打成一次调用，对简单问题很顺手，但它有两个代价：
+#   1. 调用方看不到中间发生了什么（一次 MCP ``tools/call`` 期间宿主拿不到任何进度 —— 实测 Kiro
+#      的 ``tools/call`` 不带 ``progressToken``，SDK 在 ``progress_token is None`` 时直接 return，
+#      log 通知发了也不渲染，所以"显得在工作"这件事在当前宿主下做不到）；
+#   2. 服务端得先**猜**这句话属于哪个场景，而本域的说法穷举不完 —— 猜错就走进一条取不到数的路。
+#
+# 这四个工具把编排权交回调用方：你看着工具描述自己决定调哪个、什么顺序、参数填什么，就像用任何
+# 别的工具一样。每个工具独立、无序要求；宿主天然会把每次调用显示出来，进度问题顺带解决。
+#
+# 实测过的前提（2026-11-02，逐条验证，别凭推测改动）：
+#   · 「意图文本 + 尾随 JSON」能一次直达对应的 verb —— ``{"keyword": …}`` 落 search、
+#     ``{"operation_id": …}`` 落 describe（服务端 plan 的 ``only_if: "!operation_id"`` 会跳过搜索）；
+#   · 卡片位置**可以跳**，不必按顺序把前面的步走完；
+#   · 但 ``{"operation_id", "params"}`` **不能**一次直达取数 —— 取数那步在等
+#     ``capability-detail#run-query`` 这个动作，这是服务端有意设的关卡（先读过参数规格再花钱）。
+#     所以 ``lookup_query`` 内部走两次：先到参数规格卡，再回传 ``run-query``。对你仍是一次调用。
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# 开场文本：**逐字**取自 data 域各 scenario 的 ``intent_keywords``，不是随手写的说明文字。
+# 服务端按关键词把消息分到 scenario，开场文本决定落哪条 plan —— 换一句措辞就会落到另一条路上。
+# 实测 2026-11-02：原先写的 "show the parameter spec for this capability" 谁都不命中（"parameter
+# spec for" 刚从关键词表里删掉），于是走兜底落到 browse_categories，describe 工具拿回了类别卡。
+# 改这两个常量前先对一遍 schema 的 scenarios.*.intent_keywords，并重跑 tests/test_lookup_granular_tools.py。
+_OPEN_RUN_QUERY = "run this capability"      # run_query.intent_keywords.en
+_OPEN_CATEGORIES = "list data categories"    # browse_categories.intent_keywords.en
+
+
+async def _lookup_session(member_id: str = "") -> str:
+    """开一个只读查询会话（与订单/支付会话隔离），并沿用当前 flow_id。
+
+    ``ensure_flow`` 而**不是** ``start_new_flow``：查询是旁路，不是一段新旅程 —— 用户在订酒店途中
+    顺口问一句汇率，若在这里换掉 flow_id，那笔订单的前后步骤会断在两条旅程上。
+    """
+    bridge = _get_bridge()
+    if member_id:
+        await bridge.set_member(member_id)
+    bridge.ensure_flow()
+    return _new_session("lookup")
+
+
+async def _lookup_turn(session_id: str, text: str, inputs: dict[str, Any]) -> tuple[int, str]:
+    """发「意图文本 + 尾随 JSON」—— 服务端据此把本回合直接推进到对应的那一步。
+
+    尾随 JSON 是服务端约定的结构化输入形态（它解析消息末尾的 JSON 对象）。这里**不**自己拼
+    自然语言去"描述"要做什么：那等于又把判断权交回服务端的猜测。
+    """
+    payload = json.dumps(inputs, ensure_ascii=False)
+    return await _get_bridge().send_text(_ctx(session_id), f"{text}\n{payload}")
+
+
+@mcp.tool()
+async def lookup_categories(member_id: str = "") -> dict[str, Any]:
+    """**FREE** — list what kinds of data can be looked up (16 categories + how many capabilities each).
+
+    Use it to answer "what can you look up?", or to orient yourself before searching. No upstream
+    call, nothing is charged.
+
+    Returns ``{session_id, cards, text, …}``; the categories are in the card's
+    ``data.content.categories`` as ``[{category, endpoints}, …]``. Keep the ``session_id`` if you
+    intend to continue in the same session, though the other ``lookup_*`` tools do not require it.
+    """
+    sid = await _lookup_session(member_id)
+    bridge = _get_bridge()
+    try:
+        # 第一跳：开场，服务端渲染入口卡。
+        status, raw = await _lookup_turn(sid, _OPEN_CATEGORIES, {})
+        if status >= 400:
+            return _result(sid, status, raw)
+        # 第二跳：回传入口卡的 submit（**空 payload** —— 给了 keyword 就会跳过列类别直接搜）。
+        status, raw = await bridge.send_action(_ctx(sid), "data.lookup", "submit", {})
+    except AuthError as exc:
+        return {"session_id": sid, "error": f"auth failed: {exc}", "cards": [], "text": ""}
+    return _result(sid, status, raw)
+
+
+@mcp.tool()
+async def lookup_search(keyword: str, limit: int = 15, member_id: str = "") -> dict[str, Any]:
+    """**FREE** — find which data capabilities can answer a question. Step 1 of a lookup.
+
+    ``keyword`` **MUST BE ENGLISH.** The capability index (operationId / path / summary / tags) is
+    English-only, so a Chinese or other non-English keyword returns ZERO hits. Translate the user's
+    wording into English domain terms yourself and pass only those terms:
+    「上海讯联数据服务有限公司的公司资料」→ ``"company profile"``;
+    「查最新国内新闻」→ ``"news search"``; 「比特币价格」→ ``"crypto price"``;
+    「这个网站的外链」→ ``"backlink"``.
+
+    **Put only the TOPIC here, never the specific subject.** A company name, ticker, @handle or URL
+    belongs in ``lookup_query(params=…)`` later — not in the keyword. Searching for
+    ``"上海讯联数据服务有限公司"`` finds nothing; searching for ``"company profile"`` finds the
+    capabilities that can then be asked about that company.
+
+    Returns candidates in the card's ``data.content.results`` as
+    ``[{operationId, method, path, tags, summary, price_usd}, …]``, ranked by relevance. Capabilities
+    whose parameter spec is incomplete, or whose required parameter is an opaque external id you
+    would have to obtain elsewhere, are ranked lower — they are usually unusable from a plain
+    question. Pick one and read its spec with ``lookup_describe``.
+
+    Nothing is charged here.
+    """
+    sid = await _lookup_session(member_id)
+    inputs: dict[str, Any] = {"keyword": keyword}
+    if limit and limit != 15:
+        inputs["limit"] = int(limit)
+    try:
+        status, raw = await _lookup_turn(sid, _OPEN_RUN_QUERY, inputs)
+    except AuthError as exc:
+        return {"session_id": sid, "error": f"auth failed: {exc}", "cards": [], "text": ""}
+    return _result(sid, status, raw)
+
+
+@mcp.tool()
+async def lookup_describe(operation_id: str, member_id: str = "") -> dict[str, Any]:
+    """**FREE** — read a capability's parameter spec, unit price and calling notes. Step 2 of a lookup.
+
+    ``operation_id`` is an ``operationId`` from ``lookup_search`` — pass it **verbatim**; it is an
+    identifier from the capability catalogue, not something to guess or shorten.
+
+    **Do this before every ``lookup_query``.** Parameter names are CASE-SENSITIVE and differ per
+    capability; keys you guess wrong are dropped, the capability then rejects the call for a missing
+    required field, and that failed call is still billed. Reading the spec first is free.
+
+    The returned card's ``data`` carries ``params`` (each ``{name, in, required, type, desc}``),
+    ``required``, ``usage`` (human-readable calling notes), ``price_usd`` (may be ``null`` — then the
+    cost is not knowable in advance) and ``cost_tier``.
+
+    If ``params`` is empty while ``method`` is ``POST``, the spec is MISSING from the catalogue rather
+    than the capability taking no parameters — calling it with empty params will usually be rejected
+    yet still billed. Prefer another capability whose spec is complete.
+
+    You can call this directly without searching first, if you already know the ``operationId``.
+    Nothing is charged here.
+    """
+    sid = await _lookup_session(member_id)
+    try:
+        # 带 operation_id 开场**一次**就到参数规格卡：plan 的 search 步有
+        # ``only_if: "!operation_id"``，给了它就跳过搜索（实测 C）。
+        status, raw = await _lookup_turn(
+            sid, _OPEN_RUN_QUERY, {"operation_id": operation_id},
+        )
+    except AuthError as exc:
+        return {"session_id": sid, "error": f"auth failed: {exc}", "cards": [], "text": ""}
+    return _result(sid, status, raw)
+
+
+@mcp.tool()
+async def lookup_query(
+    operation_id: str,
+    params: dict[str, Any] | None = None,
+    member_id: str = "",
+) -> dict[str, Any]:
+    """**BILLED PER CALL** — run a capability and get its data. Final step of a lookup.
+
+    ``operation_id`` verbatim from ``lookup_search`` / ``lookup_describe``. ``params`` uses the names
+    from that capability's spec — **CASE-SENSITIVE**; unknown keys are dropped. The user's specific
+    subject (company name, ticker, @handle, URL, coin id …) goes HERE, not in the search keyword.
+
+    **Read the spec with ``lookup_describe`` first.** This tool walks the capability's spec card
+    internally before running it, so a wrong ``operation_id`` fails without charging — but wrong
+    PARAMETER NAMES are not caught: the capability rejects the call for a missing required field and
+    the call is still billed. That is the most common way to waste a call here.
+
+    Returns the card's ``data.data`` — **the capability's own response, passed through unchanged**;
+    its shape differs per capability, parse it according to the spec you read. ``data.cost_usd`` is
+    what this call actually cost, and it is authoritative over any ``price_usd`` quoted earlier.
+
+    **Reading results:** for search-type capabilities the ``url`` of each hit is often just a site or
+    section homepage, while the actual content of the day sits in a summary field whose name varies
+    (``Summary`` / ``Snippet`` / ``content`` / ``text`` / ``description`` …). Do not judge whether you
+    got content by the shape of the ``url``. Only once you have confirmed the summaries really lack
+    what you need should you consider fetching one of those urls with a scraping capability — that is
+    another billed call.
+
+    Failures are not retried and do not fall back to another capability. Before retrying, re-check
+    the parameter names against the spec; pass the same ``idempotency_key``-free request again only
+    if you believe the failure was transient.
+    """
+    sid = await _lookup_session(member_id)
+    bridge = _get_bridge()
+    try:
+        # 第一跳：到参数规格卡。服务端的关卡要求取数前经过它 —— 「文本 + {operation_id, params}」
+        # **不能**一次直达取数（2026-11-02 实测 T6），所以这里先把流程停在规格卡上。
+        status, raw = await _lookup_turn(
+            sid, _OPEN_RUN_QUERY,
+            {"operation_id": operation_id, "params": params or {}},
+        )
+        if status >= 400:
+            return _result(sid, status, raw)
+        # 第二跳：回传规格卡的 ``run-query`` 动作，这才真正取数。
+        status, raw = await bridge.send_action(
+            _ctx(sid), "data.capability-detail", "run-query",
+            {"operationId": operation_id, "params": params or {}},
+        )
+    except AuthError as exc:
+        return {"session_id": sid, "error": f"auth failed: {exc}", "cards": [], "text": ""}
+    return _result(sid, status, raw)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 入口必须留在文件**最末尾** —— 它下面不能再有 @mcp.tool()。
+#
+# 2026-11-02 踩过：四个 lookup_* 被加在这个 if 块**之后**，于是 ``python -m …server`` 执行到这里
+# 就进 main() → mcp.run() 阻塞 serve-forever，后面的 @mcp.tool() 永远不执行 —— 宿主只看到 14 个
+# 工具，而源码里有 18 个。``import`` 这个模块时 __name__ 不是 "__main__"，if 块被跳过、全部定义
+# 都注册，所以单测和"import 后数函数"都查不出来（111 个测试全过）。
+# 新增工具一律加在这一行**以上**。
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
