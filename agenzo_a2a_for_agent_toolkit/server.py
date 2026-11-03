@@ -1878,7 +1878,7 @@ async def lookup_categories(member_id: str = "") -> dict[str, Any]:
 async def lookup_search(keyword: str, limit: int = 15, member_id: str = "") -> dict[str, Any]:
     """**FREE** — find which data capabilities can answer a question. Step 1 of a lookup.
 
-    ``keyword`` **MUST BE ENGLISH.** The capability index (operationId / path / summary / tags) is
+    ``keyword`` **MUST BE ENGLISH.** The capability index (identifier, summary, tags) is
     English-only, so a Chinese or other non-English keyword returns ZERO hits. Translate the user's
     wording into English domain terms yourself and pass only those terms:
     「上海讯联数据服务有限公司的公司资料」→ ``"company profile"``;
@@ -1891,7 +1891,7 @@ async def lookup_search(keyword: str, limit: int = 15, member_id: str = "") -> d
     capabilities that can then be asked about that company.
 
     Returns candidates in the card's ``data.content.results`` as
-    ``[{operationId, method, path, tags, summary, price_usd}, …]``, ranked by relevance. Capabilities
+    ``[{operationId, method, tags, summary, price_usd}, …]``, ranked by relevance. Capabilities
     whose parameter spec is incomplete, or whose required parameter is an opaque external id you
     would have to obtain elsewhere, are ranked lower — they are usually unusable from a plain
     question. Pick one and read its spec with ``lookup_describe``.
