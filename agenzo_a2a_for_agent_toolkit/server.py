@@ -814,7 +814,7 @@ async def lookup(request: str, member_id: str = "") -> dict[str, Any]:
       - web & news search — "latest domestic news", "search the web for X";
       - social, SEO & search data — follower counts, keyword rankings, backlinks;
       - research & company/people lookups — papers, patents, funding, company profiles;
-      - "what data can you look up?" — lists the available categories (free, no upstream call).
+      - "what data can you look up?" — lists the available categories (free).
 
     Not sure whether a request is a lookup or a transaction? ``discover()`` returns the live domain
     list. A rule of thumb: if answering it would create or change nothing, it belongs here.
@@ -825,7 +825,8 @@ async def lookup(request: str, member_id: str = "") -> dict[str, Any]:
     the final data fetch, and it can **only** be driven from the ``data.capability-detail`` card's
     ``run-query`` action. You therefore always pass through that card — which carries the
     capability's ``price_usd`` and ``cost_tier`` — *before* anything is charged. Read those fields
-    there; that card is where you decide whether to spend.
+    there; that card is where you decide whether to spend. Both ``price_usd`` and ``cost_usd`` are
+    what the caller pays, so they can be used directly for budgeting.
 
     Getting to it is free: listing categories, searching for a capability, and reading its
     parameter spec never touch a paid call. A single fetch is typically well under a cent, so the
@@ -1853,8 +1854,8 @@ async def _lookup_turn(session_id: str, text: str, inputs: dict[str, Any]) -> tu
 async def lookup_categories(member_id: str = "") -> dict[str, Any]:
     """**FREE** — list what kinds of data can be looked up (16 categories + how many capabilities each).
 
-    Use it to answer "what can you look up?", or to orient yourself before searching. No upstream
-    call, nothing is charged.
+    Use it to answer "what can you look up?", or to orient yourself before searching.
+    Nothing is charged.
 
     Returns ``{session_id, cards, text, …}``; the categories are in the card's
     ``data.content.categories`` as ``[{category, endpoints}, …]``. Keep the ``session_id`` if you
@@ -1962,7 +1963,10 @@ async def lookup_query(
 
     Returns the card's ``data.data`` — **the capability's own response, passed through unchanged**;
     its shape differs per capability, parse it according to the spec you read. ``data.cost_usd`` is
-    what this call actually cost, and it is authoritative over any ``price_usd`` quoted earlier.
+    what this call costs, and it is authoritative over any ``price_usd`` quoted earlier.
+
+    **Re-sending the same query is charged again.** Keep a result you may need twice instead of
+    asking for it a second time.
 
     **Reading results:** for search-type capabilities the ``url`` of each hit is often just a site or
     section homepage, while the actual content of the day sits in a summary field whose name varies
