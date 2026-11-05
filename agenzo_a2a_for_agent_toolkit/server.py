@@ -831,8 +831,10 @@ async def lookup(request: str, member_id: str = "") -> dict[str, Any]:
     Getting to it is free: listing categories, searching for a capability, and reading its
     parameter spec never touch a paid call. A single fetch is typically well under a cent, so the
     usual judgement is "just answer the question". **Ask the user first** when they have signalled
-    they care about cost, when the card shows no ``price_usd`` (``cost_tier: variable`` — the cost
-    is not knowable in advance), or when you are about to run several fetches in a row.
+    they care about cost, when the card's ``price_estimate_usd`` shows this is an expensive one
+    (usage-based capabilities range up to several USD per call), or when you are about to run
+    several fetches in a row. A card with no ``price_usd`` is not by itself a reason to ask —
+    check ``price_estimate_usd`` first; most usage-based capabilities are still well under a cent.
 
     **Strictly read-only**: results are returned to you and nothing else. They never enter an order,
     payment or settlement flow, and this tool can neither create nor modify anything.
@@ -1892,7 +1894,10 @@ async def lookup_search(keyword: str, limit: int = 15, member_id: str = "") -> d
     capabilities that can then be asked about that company.
 
     Returns candidates in the card's ``data.content.results`` as
-    ``[{operationId, method, tags, summary, price_usd}, …]``, ranked by relevance. Capabilities
+    ``[{operationId, method, tags, summary, price_usd}, …]`` — plus ``price_estimate_usd`` on the
+    items whose ``price_usd`` is ``null`` (usage-based pricing; it is a magnitude estimate, not a
+    committed price). One screen of candidates can mix capabilities that differ by four orders of
+    magnitude in price, so compare those fields before picking. Ranked by relevance. Capabilities
     whose parameter spec is incomplete, or whose required parameter is an opaque external id you
     would have to obtain elsewhere, are ranked lower — they are usually unusable from a plain
     question. Pick one and read its spec with ``lookup_describe``.
@@ -1922,8 +1927,12 @@ async def lookup_describe(operation_id: str, member_id: str = "") -> dict[str, A
     required field, and that failed call is still billed. Reading the spec first is free.
 
     The returned card's ``data`` carries ``params`` (each ``{name, in, required, type, desc}``),
-    ``required``, ``usage`` (human-readable calling notes), ``price_usd`` (may be ``null`` — then the
-    cost is not knowable in advance) and ``cost_tier``.
+    ``required``, ``usage`` (human-readable calling notes), ``price_usd`` and ``cost_tier``.
+
+    ``price_usd`` is ``0`` when the step is free, and ``null`` when there is no fixed price
+    (usage-based). In the ``null`` case the card also carries ``price_estimate_usd`` — a magnitude
+    estimate rather than a committed price, but enough to tell an expensive capability from a cheap
+    one before you spend. Some usage-based capabilities cost well over 2 USD per call, so read it.
 
     If ``params`` is empty while ``method`` is ``POST``, the spec is MISSING from the catalogue rather
     than the capability taking no parameters — calling it with empty params will usually be rejected
