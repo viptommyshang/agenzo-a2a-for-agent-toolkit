@@ -1854,10 +1854,14 @@ async def _lookup_turn(session_id: str, text: str, inputs: dict[str, Any]) -> tu
 
 @mcp.tool()
 async def lookup_categories(member_id: str = "") -> dict[str, Any]:
-    """**FREE** — list what kinds of data can be looked up (16 categories + how many capabilities each).
+    """**FREE** — list every category of data that can be looked up, with how many capabilities each holds.
 
     Use it to answer "what can you look up?", or to orient yourself before searching.
     Nothing is charged.
+
+    The category count and the per-category totals both move whenever capabilities are added or
+    retired upstream, so this tool's live return is the only authoritative answer — do not rely on
+    a number quoted anywhere else.
 
     Returns ``{session_id, cards, text, …}``; the categories are in the card's
     ``data.content.categories`` as ``[{category, endpoints}, …]``. Keep the ``session_id`` if you

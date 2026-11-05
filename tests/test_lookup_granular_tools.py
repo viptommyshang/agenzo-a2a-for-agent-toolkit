@@ -169,12 +169,35 @@ class GranularLookupToolsTest(unittest.TestCase):
         走兜底落到 ``browse_categories``，describe 拿回了**类别卡**。开场文本是契约的一部分。
         """
         import json as _json
+        import os as _os
         import pathlib as _pathlib
 
-        schema = _json.loads(_pathlib.Path(
-            r"e:\work\gitlab-projects\ai-payment\agenzo-agent-orchestrator-base"
-            r"\.worktrees\aisa-data-provider\app\schemas\refactor\data-aisa.json"
-        ).read_text(encoding="utf-8-sig"))
+        # 契约的另一半在**兄弟仓**里，所以按本文件位置推导：
+        # <workspace>/agenzo-a2a-for-agent-toolkit/tests/ → <workspace>/agenzo-agent-orchestrator-base/。
+        # ``AGENZO_DATA_AISA_SCHEMA`` 可指向别处；单仓 checkout（CI）下取不到就 skip ——
+        # 「邻仓不在」不是本仓的失败。
+        #
+        # 2026-11-05 踩过：原先这里写死了一条指向临时 worktree
+        # （``.worktrees/aisa-data-provider``）的**绝对路径**。那个 worktree 一清理本测试就红，
+        # 而且它在任何别的机器与 CI 上从来就跑不到——失败信息还会把人指向「开场文本不对」，
+        # 与真正的原因（路径不存在）无关。
+        override = _os.environ.get("AGENZO_DATA_AISA_SCHEMA", "").strip()
+        schema_path = (
+            _pathlib.Path(override)
+            if override
+            else _pathlib.Path(__file__).resolve().parents[2]
+            / "agenzo-agent-orchestrator-base"
+            / "app"
+            / "schemas"
+            / "refactor"
+            / "data-aisa.json"
+        )
+        if not schema_path.is_file():
+            self.skipTest(
+                f"base 的 data-aisa.json 不可达（{schema_path}）——"
+                " 单仓环境跳过跨仓校验，需要时用 AGENZO_DATA_AISA_SCHEMA 指路"
+            )
+        schema = _json.loads(schema_path.read_text(encoding="utf-8-sig"))
         scen = schema["scenarios"]
         self.assertIn(server._OPEN_RUN_QUERY,
                       scen["run_query"]["intent_keywords"]["en"],
