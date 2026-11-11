@@ -244,6 +244,9 @@ def _result(session_id: str, status: int, raw: str) -> dict[str, Any]:
         out["flow_id"] = flow_id
     # 记下本轮卡片声明的动作 carries，供下一次 act 按声明判定结算动作（见 _remember_card_actions）。
     _remember_card_actions(session_id, out)
+    # 这张卡能付钱时，把三条结算轨以**结构化**形式挂上 —— 协议本身只暴露一个 `pay` 动作，
+    # 「有哪几条轨」没有载体，光写在 guide 散文里 agent 会漏（见 _attach_settlement_rails）。
+    _attach_settlement_rails(out)
     return out
 
 
@@ -636,6 +639,102 @@ def _attach_token_path_failure(
     advice = _token_path_failure_advice(session_id, component, action, payload, out)
     if advice:
         out["token_path_failure"] = advice
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 结算轨提示：把「这一笔可以怎么付」做成**结构化**数据，而不是指望 agent 从 guide 的散文里推
+# ─────────────────────────────────────────────────────────────────────────────
+# 为什么必须结构化：订单卡只暴露 ONE 个 `pay` 动作（``carries: ["order_id"]``，连凭证字段都没
+# 有），所以「有哪几条轨可选」在协议里**完全没有载体** —— agent 只能从 guide 的两百多行散文里
+# 自己推。2026-11-11 实测两轮：把三条轨写进 guide（含优先序与歧义消解）后，agent 仍只向用户列出
+# 两条（network token / EVO 3DS），漏掉中间那条静默网关令牌轨。散文控制不住一个 LLM 的选项列表，
+# 而这份 dict 直接出现在工具返回值里、紧贴着那张卡，agent 必读。
+_SETTLEMENT_RAIL_ACTION_IDS = frozenset({"pay", "checkout"})
+
+_SETTLEMENT_RAILS_HINT: dict[str, Any] = {
+    "note": (
+        "This card exposes a money-settling action. THREE rails can settle it — surface ALL THREE "
+        "to the user (with the silent/3DS difference) and advance only on their explicit pick. "
+        "Never choose a rail for them, and never drop a rail from the list you show."
+    ),
+    "offer_in_this_order": [
+        {
+            "n": 1,
+            "rail": "network_token",
+            "label": "Network token (default)",
+            "browser_page": False,
+            "how": (
+                "start_token_creation(amount_cents=<order amount>, order_id=<this order>, "
+                "member_id=<same member>, provider_id=<order's provider>) → settle this action "
+                "carrying the minted payment_token_id"
+            ),
+            "take_when": "the user states no preference",
+        },
+        {
+            "n": 2,
+            "rail": "gateway_token",
+            "label": "Gateway token — SILENT, no browser page",
+            "browser_page": False,
+            "how": (
+                'same as rail 1 plus token_credential="gateway_token" → settle this action carrying '
+                "that payment_token_id (charge goes out as paymentMethod.type=token, no cryptogram)"
+            ),
+            "take_when": (
+                "the user says gateway token / silent / unattended / no browser page / virtual "
+                "card — OR the card has no network token at all (rail 1 then FAILS at the mint)"
+            ),
+        },
+        {
+            "n": 3,
+            "rail": "evo_3ds",
+            "label": "EVO card with 3DS web authorization",
+            "browser_page": True,
+            "how": (
+                "settle this action carrying payment_method_id + evo_explicit=true → the settle "
+                "returns AUTHENTICATION_REQUIRED, open the 3DS page, then resume"
+            ),
+            "take_when": (
+                "ONLY an explicit ask for cardholder authentication / a web authorization page"
+            ),
+        },
+    ],
+    "disambiguating_gateway": (
+        "Rails 2 and 3 are BOTH commonly called a 'gateway token' payment, and both put the card's "
+        "gateway token on the wire. The words 'gateway' / 'gateway token' ALONE — with no ask for "
+        "authentication or a page — mean RAIL 2, the SILENT one. Never fall to rail 3 just because "
+        "the word appeared; ask the user if you are truly unsure."
+    ),
+}
+
+
+def _has_settlement_rail_action(out: dict[str, Any]) -> bool:
+    """本轮卡片里是否有「锁单之后付款」那个动作。
+
+    判据刻意不复用 :func:`_is_settle_action`：那个按 ``carries`` 里有没有支付凭证字段判定，而订单
+    卡的 ``pay`` 只 ``carries: ["order_id"]``（凭证是调用方自己加的可选 payload），于是它对这里恰好
+    返回 False。此处要的是「这张卡能不能付钱」，用动作 id + 有 ``write``（服务端写动作）判定，不
+    依赖任何域名或 write 名，新增域自动覆盖。
+    """
+    for card in out.get("cards") or ():
+        if not isinstance(card, dict):
+            continue
+        for act in card.get("actions") or ():
+            if not isinstance(act, dict):
+                continue
+            if str(act.get("id") or "").strip().lower() not in _SETTLEMENT_RAIL_ACTION_IDS:
+                continue
+            if str(act.get("write") or "").strip():
+                return True
+    return False
+
+
+def _attach_settlement_rails(out: dict[str, Any]) -> dict[str, Any]:
+    """卡片带结算动作时，把三条轨挂到 ``out["settlement_rails"]`` 后原样返回。
+
+    非阻塞、只读：不改卡片、不改其余字段、不替调用方选轨。"""
+    if _has_settlement_rail_action(out):
+        out["settlement_rails"] = _SETTLEMENT_RAILS_HINT
     return out
 
 
@@ -1172,6 +1271,7 @@ async def start_token_creation(
     order_id: str = "",
     payment_method_id: str = "",
     provider_id: str | None = None,
+    token_credential: str = "",
 ) -> dict[str, Any]:
     """Mint a REUSABLE Network_Token in an INDEPENDENT payment session (create-token scenario).
 
@@ -1189,6 +1289,25 @@ async def start_token_creation(
     Minting works on ALL THREE rails by the CARD's brand: UnionPay (``open_url`` checkout passkey →
     poll to ACTIVE), Visa (``open_url`` payment_url FIDO passkey → poll to ACTIVE), or EVO/Mastercard
     (SYNCHRONOUS — no browser step).
+
+    ``token_credential`` (optional, EVO/Mastercard cards ONLY — ignored for UnionPay/Visa) picks WHICH
+    CREDENTIAL the minted token carries, and that choice decides whether the LATER charge is silent:
+      · omitted / ``"network_token"`` (DEFAULT, unchanged behaviour) — mints a cryptogram-bearing
+        network token; the charge goes out as ``paymentMethod.type=networkToken``.
+      · ``"gateway_token"`` — mints NOTHING: the token carries the card's own EVO gateway (COF) token
+        and NO cryptogram, so the charge goes out as ``paymentMethod.type=token`` and settles in ONE
+        call with **NO 3DS page and NO browser step**.
+    RAIL PRIORITY (see the guide's THREE SETTLEMENT RAILS): ``network_token`` is the DEFAULT for a
+    user who states no preference. Pass ``gateway_token`` whenever the user ASKS for a 'gateway token'
+    / silent / unattended / virtual-card payment, and also when the card has NO network token (a
+    frictionless binding yields none, so the default mint FAILS). Never substitute the default on a
+    user who named this one: "the network token is browser-less too" is NOT a reason to override
+    their choice. The form is fixed onto the token HERE, at mint time; every later charge of this token
+    — INCLUDING a merchant order's ``pay`` (hotel / flight / ride) — reads it off the token document,
+    so there is nothing to pass at charge time.
+    DO NOT CONFUSE THIS WITH THE EVO DIRECT RAIL: ``payment_method_id`` + ``evo_explicit=true`` on an
+    order's ``pay`` is EVO pre-auth, which ALWAYS raises a 3DS challenge. When the user asks for a
+    'gateway token' / silent / no-browser / virtual-card payment they mean THIS argument, not that rail.
 
     WHY A SEPARATE SESSION: an A2A context owns a single ``flow_state`` (one active scenario, no
     scenario stack); a cross-domain strong intent RESETS that ``flow_state``. Minting inline in a
@@ -1334,6 +1453,12 @@ async def start_token_creation(
         # --provider-id（flag 出现即上送、空串原样转发）同口径。
         if provider_id is not None:
             submit_payload["provider_id"] = provider_id
+        # EVO 卡的凭证形态（见下方 docstring 的 ``token_credential``）。只在非空时上送：空 = 不声明，
+        # 由编排器落缺省 ``network_token``（既有行为一字不变）。与 provider_id 的 ``is not None``
+        # 判据刻意不同——那个字段「声明了无效值」要 fail-closed，而这里空串没有独立语义，拼装时漏填
+        # 不该变成一次被拒的建币。取值拼错时平台会显式 INVALID_REQUEST，不会静默回落。
+        if token_credential:
+            submit_payload["token_credential"] = token_credential
         status, raw = await bridge.send_action(
             _ctx(sid),
             "payment.token-setup",
@@ -1523,6 +1648,25 @@ CARD MANAGEMENT (list / view / disable / add a card) — ALWAYS via book(), NEVE
     cards (never disabled/pending). Do not invent an amount or recipient just to browse cards.
 
 PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (own session)
+  THREE SETTLEMENT RAILS FOR AN ORDER — surface ALL THREE to the user and advance only on their
+  pick (the CORE PRINCIPLE applies: never choose a rail for them). Offer them in THIS order:
+    1. NETWORK TOKEN — the DEFAULT. Mint a cryptogram-bearing token from the card and settle in one
+       call: no browser step, no 3DS page. Take it whenever the user states no preference.
+    2. GATEWAY TOKEN, SILENT — mint with token_credential="gateway_token". The token carries the
+       card's own EVO gateway (COF) token and NO cryptogram, so the charge settles as
+       paymentMethod.type=token in ONE call with NO 3DS page and NO browser step. Take this
+       whenever the user says 'gateway token' / silent / unattended / 'no browser page' / virtual
+       card — and also when the card has NO network token at all (a frictionless binding yields
+       none, so rail 1 would FAIL at the mint).
+    3. EVO CARD WITH 3DS — payment_method_id + evo_explicit=true (EVO pre-auth). ALWAYS raises a
+       3DS/FIDO page: the settle returns AUTHENTICATION_REQUIRED, you open the page, the user
+       completes it, then you resume. Offer it LAST, and take it only when the user explicitly wants
+       the cardholder-authenticated / web-authorized form.
+  DISAMBIGUATING 'GATEWAY' — rails 2 and 3 are BOTH commonly called a 'gateway token' payment and
+  both put the card's gateway token on the wire. When the user says only 'gateway' / 'gateway token'
+  WITHOUT asking for authentication or a page, they mean RAIL 2 — the SILENT one. Choose rail 3 only
+  on an explicit ask for 3DS / a web authorization / cardholder verification. If truly unsure, ask —
+  but do NOT default to rail 3 just because the word 'gateway' appeared.
   • Booking + payment MUST share the same member_id.
   • DEFAULT / CANONICAL MAIN PATH — you MUST take it UNLESS the user EXPLICITLY chose an EVO card.
     For a pay-per-call order, settle via an INDEPENDENT NETWORK-TOKEN DIRECT CHARGE — a THREE-STAGE
@@ -1583,6 +1727,14 @@ PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (ow
     ONLY when — the user explicitly chose the EVO rail, include evo_explicit=true in the settle
     payload (alongside any payment_method_id). Never set evo_explicit=true to silence the gate on the
     default path; the correct default is to mint a Network_Token and pay with payment_token_id.
+    NOT A SILENT RAIL: this EVO pre-auth ALWAYS requests cardholder authentication (a 3DS/FIDO page)
+    and the settle comes back AUTHENTICATION_REQUIRED — you then open the page, the user finishes it,
+    and you resume. So NEVER reach for evo_explicit=true to satisfy a request for a silent /
+    unattended / 'no browser page' / virtual-card payment: that one is the mint-time
+    token_credential="gateway_token" above. The two are easy to mix up because BOTH are commonly
+    called a 'gateway token' payment — the difference is that only the minted-token form is silent.
+    This rail is RAIL 3 of the three at the top of this section: offer it LAST, and only for an
+    explicit ask for cardholder authentication / a web authorization page.
   • start_payment(amount_cents, recipient_name, recipient_account) — EXPLICIT / FALLBACK ONLY —
     opens a SEPARATE payment session and returns a picker listing ALL the member's cards (any
     brand). Drive it with act(payment_session_id, ...) like the loop above.
@@ -1607,6 +1759,24 @@ PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (ow
     tokens are "UnionPay-only", and do NOT steer them to add a UnionPay card just to mint one — any
     listed card (including an EVO Mastercard) can be minted. The "only UnionPay mints, EVO/Visa
     handed back" rule applies ONLY to paying an order via the start_payment picker.
+  • SILENT vs 3DS IS DECIDED AT MINT TIME — ``token_credential`` (EVO/Mastercard cards only).
+    start_token_creation takes an optional ``token_credential`` choosing WHICH credential the minted
+    token carries, and that fixes the on-wire rail for EVERY later charge of it (including a merchant
+    order's pay):
+      – omitted / "network_token" (DEFAULT, unchanged) — a cryptogram-bearing network token, charged
+        as paymentMethod.type=networkToken;
+      – "gateway_token" — mints NOTHING: the token carries the card's own EVO gateway (COF) token and
+        NO cryptogram, charged as paymentMethod.type=token, settling in ONE call with NO 3DS page and
+        NO browser step.
+    This is RAIL 2 of the three above. network_token stays the DEFAULT when the user states no
+    preference, but pass "gateway_token" whenever the user ASKS for a 'gateway token' / silent /
+    unattended / no-browser-page / virtual-card payment, and also when the card has NO network token
+    (a frictionless binding yields none, so the default mint FAILS). Do NOT talk the user out of it
+    and do NOT silently substitute rail 1 — "the network token is browser-less too" is NOT a reason
+    to override a rail the user named. When the user asks for any of those words, THIS is
+    what they mean — it is a MINT-TIME argument here, NOT the evo_explicit rail below, and NOT the
+    standalone-only evo_route selector. Nothing extra is passed at charge time; the order's pay still
+    just carries the minted payment_token_id.
   • AFTER binding a UnionPay card, MINT THE TOKEN BY PICKING THE CARD — do NOT shortcut. Reuse the
     SAME payment session: submit `payment.setup` with ONLY {amount_cents, recipient_name,
     recipient_account} (do NOT put payment_method_id in it), read the `payment.method-list`, then
