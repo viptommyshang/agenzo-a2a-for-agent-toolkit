@@ -886,7 +886,17 @@ async def book(request: str, member_id: str = "") -> dict[str, Any]:
     Returns ``{session_id, cards, text, state, primary_component, member_id}``. Read the last card's
     ``component``/``data``/``actions`` and advance with ``act(session_id, ...)``; use
     ``send_message(session_id, ...)`` to answer a natural-language follow-up. ``member_id`` (optional)
-    overrides the acting end user for this and subsequent calls (booking + payment must share it)."""
+    overrides the acting end user for this and subsequent calls (booking + payment must share it).
+
+    DISPLAY RULES for the user:
+    - NEVER show ``session_id``, ``member_id``, or ``flow_id`` — they are internal plumbing.
+    - The confirm card (``checkout.confirm``): show merchant, card brand + last 4 digits, and the
+      shipping address as a single line. Do NOT show card expiry, CVV, or any internal id.
+    - ``checkout.await``: tell the user it's processing and you'll check every few seconds. Do NOT
+      show ``task_id`` unless the user asks for it.
+    - ``checkout.result``: show status, errors (in the merchant's words), order_id if present,
+      amount if present, and duration. Mark ``payment-reached`` as "submitted to merchant gateway".
+    """
     bridge = _get_bridge()
     if member_id:
         await bridge.set_member(member_id)
@@ -1564,6 +1574,71 @@ async def resolve_pickup_time(local_datetime: str, timezone: str) -> dict[str, A
     except Exception as exc:  # noqa: BLE001
         return {"error": str(exc), "hint": f"Is the orchestrator running at {cfg.BASE_URL}?"}
     return _tool_result(status, raw)
+
+
+@mcp.tool()
+async def checkout(
+    checkout_url: str,
+    shipping: dict[str, Any],
+    card: dict[str, Any],
+    member_id: str = "",
+) -> dict[str, Any]:
+    """**MERCHANT CHECKOUT** — place an order on a merchant's Shopify checkout page with a card the
+    caller provides. Agenzo fills the page, submits it, handles the captcha and reports the result.
+
+    Opens a NEW session and sends the entry card ``checkout.setup#submit`` as a STRUCTURED action, so
+    the card details never travel as natural language. Do NOT put card numbers or CVV into
+    ``book``/``send_message`` text.
+
+    - ``checkout_url``: the merchant's cart or checkout URL, exactly as given.
+    - ``shipping``: ``{email, first_name, last_name, phone, country (ISO alpha-2), address1, city,
+      zip_code}`` required; ``address2`` and ``state`` optional (US merchant pages need ``state``).
+    - ``card``: ``{number, expiry ("MM/YY"), cvv, name}`` required; ``brand`` optional
+      (``visa`` | ``mastercard``, default ``visa``). Any card source is fine.
+
+    Then drive the returned cards with ``act(session_id, ...)``:
+      1) ``checkout.confirm`` shows merchant, shipping and card last 4 (no amount). Show it to the
+         USER and send ``confirm`` ONLY after they agree — it really submits the order and cannot be
+         undone. ``edit`` goes back to the form (re-send the full payload incl. ``card``); ``cancel``
+         ends without ordering.
+      2) ``checkout.await``: send ``poll`` with ``{"task_id": ...}`` every ~5 s; it usually takes
+         20–130 s. Set your own limit (~5 min).
+      3) ``checkout.result``: ``status`` tells the outcome. ``payment-reached`` = submitted to the
+         merchant's payment gateway (read ``errors``/``order_id``). Only ``captcha-failed`` offers
+         ``retry`` (send ``task_id`` + the full ``card`` again). For ``timeout``/``script-error`` the
+         order MAY have been placed — do NOT retry; check with the merchant.
+    If fields are missing, the form comes back with text listing them; fix and call this tool again."""
+    bridge = _get_bridge()
+    if member_id:
+        await bridge.set_member(member_id)
+    bridge.start_new_flow()
+    sid = _new_session("checkout")
+    payload = {"checkout_url": checkout_url, "shipping": dict(shipping or {}), "card": dict(card or {})}
+    try:
+        status, raw = await bridge.send_action(_ctx(sid), "checkout.setup", "submit", payload)
+    except AuthError as exc:
+        return {"session_id": sid, "error": f"auth failed: {exc}", "cards": [], "text": ""}
+    return _result(sid, status, raw)
+
+
+@mcp.tool()
+async def checkout_status(task_id: str, member_id: str = "") -> dict[str, Any]:
+    """Look up an existing merchant checkout task by its ``task_id`` (starts with ``ckout_``) — e.g. after a new
+    chat or when ``poll`` hit your time limit. Returns ``checkout.await`` (still running; keep
+    ``act(session_id, "checkout.await", "poll", {"task_id": ...})``) or ``checkout.result``. Only the
+    caller's own tasks are visible; a result found this way does not offer ``retry``.
+
+    DISPLAY: same rules as ``checkout`` — never show session_id/member_id/flow_id to the user."""
+    bridge = _get_bridge()
+    if member_id:
+        await bridge.set_member(member_id)
+    bridge.ensure_flow()
+    sid = _new_session("checkout")
+    try:
+        status, raw = await bridge.send_action(_ctx(sid), "checkout.lookup", "submit", {"task_id": task_id})
+    except AuthError as exc:
+        return {"session_id": sid, "error": f"auth failed: {exc}", "cards": [], "text": ""}
+    return _result(sid, status, raw)
 
 
 # Domain-AGNOSTIC driving law. It never names a specific domain, component, action or field, so it

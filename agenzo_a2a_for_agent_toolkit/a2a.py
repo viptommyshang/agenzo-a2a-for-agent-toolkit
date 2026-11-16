@@ -385,6 +385,33 @@ def _context_of(body: dict[str, Any]) -> str | None:
         return None
 
 
+_CARD_SECRET_KEYS = ("cvv", "expiry")
+
+
+def _redact_card(value: Any) -> Any:
+    """返回脱敏副本：任意层级里名为 ``card`` 的对象，``number`` 只留后 4 位，``cvv`` / ``expiry`` 置空。
+
+    只用于 DEBUG 日志与 inspect() 的记录，不影响发往编排器的请求。"""
+    if isinstance(value, list):
+        return [_redact_card(v) for v in value]
+    if not isinstance(value, dict):
+        return value
+    out: dict[str, Any] = {}
+    for key, val in value.items():
+        if key == "card" and isinstance(val, dict):
+            masked = dict(val)
+            number = "".join(ch for ch in str(masked.get("number") or "") if ch.isdigit())
+            if number:
+                masked["number"] = "****" + number[-4:]
+            for secret in _CARD_SECRET_KEYS:
+                if masked.get(secret):
+                    masked[secret] = "***"
+            out[key] = masked
+        else:
+            out[key] = _redact_card(val)
+    return out
+
+
 def _cap(text: str, maxlen: int) -> str:
     """Truncate ``text`` to ``maxlen`` chars (0 = no cap), appending a truncation note."""
     if maxlen and len(text) > maxlen:
@@ -490,7 +517,8 @@ class A2ABridge:
             # 记下本次交换所属的任务，这样 inspect() 不用翻服务器日志就能回答「这笔的
             # flow_id 是什么」——它是跨服务查全链路的那个键。
             "flow_id": self._flow_id,
-            "request": request_body,
+            # 只脱敏记录副本：卡号只留后 4 位，CVV / 有效期不留。线上发出去的请求体不变。
+            "request": _redact_card(request_body),
             "status": status,
             # Cap stored response to bound memory; exposure re-caps as needed.
             "response": _cap(response_text, self._maxlen),
@@ -502,7 +530,7 @@ class A2ABridge:
                 transport,
                 url,
                 status,
-                json.dumps(request_body, ensure_ascii=False),
+                json.dumps(record["request"], ensure_ascii=False),
                 record["response"],
             )
         return record
