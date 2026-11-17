@@ -1582,6 +1582,7 @@ async def checkout(
     shipping: dict[str, Any],
     card: dict[str, Any],
     member_id: str = "",
+    idempotency_key: str = "",
 ) -> dict[str, Any]:
     """**MERCHANT CHECKOUT** — place an order on a merchant's Shopify checkout page with a card the
     caller provides. Agenzo fills the page, submits it, handles the captcha and reports the result.
@@ -1595,11 +1596,16 @@ async def checkout(
       zip_code}`` required; ``address2`` and ``state`` optional (US merchant pages need ``state``).
     - ``card``: ``{number, expiry ("MM/YY"), cvv, name}`` required; ``brand`` optional
       (``visa`` | ``mastercard``, default ``visa``). Any card source is fine.
+    - ``idempotency_key``: OPTIONAL. The platform requires one on ``checkout.setup#submit``; when you
+      leave it empty this tool generates a fresh ``ckout-<uuid>`` per call. Pass your own (e.g. the
+      caller's order number) only to make a resend after a network timeout safe: the same key creates
+      ONE task and never orders twice, and ``checkout_status`` also accepts it in place of ``task_id``.
 
     Then drive the returned cards with ``act(session_id, ...)``:
       1) ``checkout.confirm`` shows merchant, shipping and card last 4 (no amount). Show it to the
          USER and send ``confirm`` ONLY after they agree — it really submits the order and cannot be
-         undone. ``edit`` goes back to the form (re-send the full payload incl. ``card``); ``cancel``
+         undone. ``edit`` goes back to the form (call this tool again with the full payload incl. ``card``;
+         a new key is generated unless you pass one); ``cancel``
          ends without ordering.
       2) ``checkout.await``: send ``poll`` with ``{"task_id": ...}`` every ~5 s; it usually takes
          20–130 s. Set your own limit (~5 min).
@@ -1613,7 +1619,12 @@ async def checkout(
         await bridge.set_member(member_id)
     bridge.start_new_flow()
     sid = _new_session("checkout")
-    payload = {"checkout_url": checkout_url, "shipping": dict(shipping or {}), "card": dict(card or {})}
+    payload = {
+        "checkout_url": checkout_url,
+        "shipping": dict(shipping or {}),
+        "card": dict(card or {}),
+        "idempotency_key": idempotency_key.strip() or f"ckout-{uuid4().hex}",
+    }
     try:
         status, raw = await bridge.send_action(_ctx(sid), "checkout.setup", "submit", payload)
     except AuthError as exc:

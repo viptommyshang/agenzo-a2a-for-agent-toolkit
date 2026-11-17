@@ -26,7 +26,7 @@ schema-driven, new domains (added as orchestrator schemas) work here with **no c
 | `act(session_id, component, action, payload)` | Structured card action (the main driver). |
 | `poll(session_id, component)` | Re-check an `*-await` card (`action:"poll"`). |
 | `start_payment(amount_cents, recipient_name, recipient_account)` | Separate payment session: pick/verify a card before confirming. |
-| `checkout(checkout_url, shipping, card)` | Merchant checkout: Agenzo fills and submits a Shopify checkout page with the caller's card (sent as a structured action, never as text). Then `confirm` → `poll` → result via `act`. Needs orchestrator `CHECKOUT_ENABLED=true`. |
+| `checkout(checkout_url, shipping, card, idempotency_key?)` | Merchant checkout: Agenzo fills and submits a Shopify checkout page with the caller's card (sent as a structured action, never as text). `idempotency_key` is required by the platform; the tool generates a fresh `ckout-<uuid>` per call when you omit it, or passes yours through (resend-safe). Then `confirm` → `poll` → result via `act`. Needs orchestrator `CHECKOUT_ENABLED=true`. |
 | `checkout_status(task_id)` | Look up an existing checkout task (progress or result) by `ckout_…` id. |
 | `open_url(url)` | Open a checkout / card-enrollment page in the local browser. |
 | `resolve_location(address)` | Geocode a place name → `{lat, lng, timezone}` (ride: call before `ride.search`). |

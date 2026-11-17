@@ -80,6 +80,21 @@ class CheckoutToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["cards"][-1]["component"], "checkout.confirm")
         self.assertEqual(self.fake.flow_calls, ["start_new"])
 
+    async def test_checkout_generates_idempotency_key_per_call(self) -> None:
+        keys = []
+        for _ in range(2):
+            self.fake.queue_action_response(200, _task_json([_confirm_card()]))
+            await server.checkout("https://merchant.example.com/cart/1:1", _SHIPPING, _CARD)
+            keys.append(self.fake.action_calls[-1][3]["idempotency_key"])
+        self.assertTrue(all(k.startswith("ckout-") and len(k) > 10 for k in keys))
+        self.assertNotEqual(keys[0], keys[1])
+
+    async def test_checkout_passes_through_caller_idempotency_key(self) -> None:
+        self.fake.queue_action_response(200, _task_json([_confirm_card()]))
+        await server.checkout("https://merchant.example.com/cart/1:1", _SHIPPING, _CARD,
+                              idempotency_key=" order-42 ")
+        self.assertEqual(self.fake.action_calls[-1][3]["idempotency_key"], "order-42")
+
     async def test_confirm_is_not_treated_as_money_settle(self) -> None:
         self.fake.queue_action_response(200, _task_json([_confirm_card()]))
         out = await server.checkout("https://merchant.example.com/cart/1:1", _SHIPPING, _CARD)
