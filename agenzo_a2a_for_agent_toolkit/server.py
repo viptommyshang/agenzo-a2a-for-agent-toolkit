@@ -1581,8 +1581,8 @@ async def checkout(
     checkout_url: str,
     shipping: dict[str, Any],
     card: dict[str, Any],
+    idempotency_key: str,
     member_id: str = "",
-    idempotency_key: str = "",
 ) -> dict[str, Any]:
     """**MERCHANT CHECKOUT** — place an order on a merchant's Shopify checkout page with a card the
     caller provides. Agenzo fills the page, submits it, handles the captcha and reports the result.
@@ -1596,24 +1596,41 @@ async def checkout(
       zip_code}`` required; ``address2`` and ``state`` optional (US merchant pages need ``state``).
     - ``card``: ``{number, expiry ("MM/YY"), cvv, name}`` required; ``brand`` optional
       (``visa`` | ``mastercard``, default ``visa``). Any card source is fine.
-    - ``idempotency_key``: OPTIONAL. The platform requires one on ``checkout.setup#submit``; when you
-      leave it empty this tool generates a fresh ``ckout-<uuid>`` per call. Pass your own (e.g. the
-      caller's order number) only to make a resend after a network timeout safe: the same key creates
-      ONE task and never orders twice, and ``checkout_status`` also accepts it in place of ``task_id``.
+    - ``idempotency_key``: REQUIRED, chosen by YOU (the caller); this tool never generates or fills
+      one, and an empty/blank value is rejected without contacting the platform. Make it once per
+      order (e.g. your own order number) and keep it for the life of that order. After a timeout or
+      network error, resend with the SAME key: per the platform code (orchestrator ``a2a_verbs.py``
+      ``submit_checkout``) the same key within your account returns the existing task with
+      ``replayed: true`` instead of creating a second one. Use a NEW key only for a genuinely new
+      order. Never mint a fresh key just to "retry" an order that may already be placed.
+      ``checkout_status`` also accepts the key in place of ``task_id``.
+      Unconfirmed: the platform's reply when a repeated key carries different shipping/card/URL on
+      the A2A path (the code checked returns the old task without comparing contents; the REST path
+      rejects it as a conflict) — do not rely on changing details under a reused key.
 
     Then drive the returned cards with ``act(session_id, ...)``:
       1) ``checkout.confirm`` shows merchant, shipping and card last 4 (no amount). Show it to the
          USER and send ``confirm`` ONLY after they agree — it really submits the order and cannot be
-         undone. ``edit`` goes back to the form (call this tool again with the full payload incl. ``card``;
-         a new key is generated unless you pass one); ``cancel``
-         ends without ordering.
+         undone. ``edit`` goes back to the form BEFORE any task exists (the platform only creates the
+         task at ``confirm``); resubmit it (or call this tool again) with the full payload incl.
+         ``card`` and keep the SAME ``idempotency_key`` for this order. ``cancel`` ends without ordering.
       2) ``checkout.await``: send ``poll`` with ``{"task_id": ...}`` every ~5 s; it usually takes
          20–130 s. Set your own limit (~5 min).
       3) ``checkout.result``: ``status`` tells the outcome. ``payment-reached`` = submitted to the
          merchant's payment gateway (read ``errors``/``order_id``). Only ``captcha-failed`` offers
-         ``retry`` (send ``task_id`` + the full ``card`` again). For ``timeout``/``script-error`` the
+         ``retry`` (send ``task_id`` + the full ``card`` again; the retry action carries no
+         ``idempotency_key`` — per the platform flow the retry submit takes only the new card
+         reference, so the retry task is deduplicated on that, not on your key; whether a custom key
+         can be sent on retry is unconfirmed). For ``timeout``/``script-error`` the
          order MAY have been placed — do NOT retry; check with the merchant.
-    If fields are missing, the form comes back with text listing them; fix and call this tool again."""
+    If fields are missing, the form comes back with text listing them; fix and call this tool again
+    with the same ``idempotency_key``."""
+    if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+        return {
+            "error": "missing required parameter: idempotency_key (non-empty, chosen by the caller, "
+                     "one per order; reuse the same value when resending)",
+            "cards": [], "text": "",
+        }
     bridge = _get_bridge()
     if member_id:
         await bridge.set_member(member_id)
@@ -1623,7 +1640,7 @@ async def checkout(
         "checkout_url": checkout_url,
         "shipping": dict(shipping or {}),
         "card": dict(card or {}),
-        "idempotency_key": idempotency_key.strip() or f"ckout-{uuid4().hex}",
+        "idempotency_key": idempotency_key,
     }
     try:
         status, raw = await bridge.send_action(_ctx(sid), "checkout.setup", "submit", payload)

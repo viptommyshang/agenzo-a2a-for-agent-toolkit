@@ -70,7 +70,7 @@ class CheckoutToolsTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_checkout_sends_structured_setup_submit(self) -> None:
         self.fake.queue_action_response(200, _task_json([_confirm_card()]))
-        out = await server.checkout("https://merchant.example.com/cart/1:1", _SHIPPING, _CARD)
+        out = await server.checkout("https://merchant.example.com/cart/1:1", _SHIPPING, _CARD, "order-1")
         self.assertEqual(self.fake.text_calls, [])  # 卡不走自然语言
         _ctx, comp, action, payload = self.fake.action_calls[-1]
         self.assertEqual((comp, action), ("checkout.setup", "submit"))
@@ -80,24 +80,31 @@ class CheckoutToolsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["cards"][-1]["component"], "checkout.confirm")
         self.assertEqual(self.fake.flow_calls, ["start_new"])
 
-    async def test_checkout_generates_idempotency_key_per_call(self) -> None:
-        keys = []
-        for _ in range(2):
-            self.fake.queue_action_response(200, _task_json([_confirm_card()]))
-            await server.checkout("https://merchant.example.com/cart/1:1", _SHIPPING, _CARD)
-            keys.append(self.fake.action_calls[-1][3]["idempotency_key"])
-        self.assertTrue(all(k.startswith("ckout-") and len(k) > 10 for k in keys))
-        self.assertNotEqual(keys[0], keys[1])
-
     async def test_checkout_passes_through_caller_idempotency_key(self) -> None:
         self.fake.queue_action_response(200, _task_json([_confirm_card()]))
-        await server.checkout("https://merchant.example.com/cart/1:1", _SHIPPING, _CARD,
-                              idempotency_key=" order-42 ")
-        self.assertEqual(self.fake.action_calls[-1][3]["idempotency_key"], "order-42")
+        await server.checkout("https://merchant.example.com/cart/1:1", _SHIPPING, _CARD, idempotency_key=" order-42 ")
+        # 原样透传，不 strip、不改写
+        self.assertEqual(self.fake.action_calls[-1][3]["idempotency_key"], " order-42 ")
+
+    async def test_checkout_resend_keeps_same_key(self) -> None:
+        for _ in range(2):
+            self.fake.queue_action_response(200, _task_json([_confirm_card()]))
+            await server.checkout("https://merchant.example.com/cart/1:1", _SHIPPING, _CARD, idempotency_key="order-42")
+        keys = [c[3]["idempotency_key"] for c in self.fake.action_calls]
+        self.assertEqual(keys, ["order-42", "order-42"])
+
+    async def test_checkout_rejects_missing_or_blank_idempotency_key(self) -> None:
+        with self.assertRaises(TypeError):  # 不传：必填参数，没有默认值
+            await server.checkout("https://merchant.example.com/cart/1:1", _SHIPPING, _CARD)  # type: ignore[call-arg]
+        for blank in ("", "   ", "\t\n"):
+            out = await server.checkout("https://merchant.example.com/cart/1:1", _SHIPPING, _CARD, idempotency_key=blank)
+            self.assertIn("idempotency_key", out["error"])
+        self.assertEqual(self.fake.action_calls, [])  # 没有发任何动作
+        self.assertEqual(self.fake.flow_calls, [])  # 也没有开新流程
 
     async def test_confirm_is_not_treated_as_money_settle(self) -> None:
         self.fake.queue_action_response(200, _task_json([_confirm_card()]))
-        out = await server.checkout("https://merchant.example.com/cart/1:1", _SHIPPING, _CARD)
+        out = await server.checkout("https://merchant.example.com/cart/1:1", _SHIPPING, _CARD, "order-1")
         self.fake.queue_action_response(200, _task_json([_await_card()]))
         res = await server.act(out["session_id"], "checkout.confirm", "confirm", {})
         for key in ("default_orchestration", "payment_warning", "evo_orchestration"):
