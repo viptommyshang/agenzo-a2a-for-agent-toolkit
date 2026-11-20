@@ -124,7 +124,7 @@ class TripAggregatePaymentTest(unittest.IsolatedAsyncioTestCase):
     # ── 文案契约：start_token_creation 的 docstring 写明支付组绑定 ──────────────────────
     def test_start_token_creation_docstring_documents_group_binding(self) -> None:
         """``start_token_creation`` 的 docstring 必须写明聚合场景下 ``order_id`` 传支付组 id、
-        ``amount_cents`` 传整车总额（而非任一子订单金额），以及 EVO/Mastercard 同步创建。
+        ``amount_cents`` 传整车总额（而非任一子订单金额），以及 Mastercard 同步创建。
 
         这份 docstring 就是 MCP 工具描述，调用方（agent）只能看到它 —— 说明缺失等于让调用方
         按单订单的直觉去传参，把聚合令牌绑到其中一张子订单上。
@@ -140,7 +140,7 @@ class TripAggregatePaymentTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("NOT any single sub-order", doc)
         # 绑定值经 external_transaction_id 落到令牌上。
         self.assertIn("external_transaction_id", doc)
-        # Mastercard/EVO 这条轨同步创建、无 passkey 环节。
+        # Mastercard 这条轨同步创建、无 passkey 环节。
         self.assertIn("SYNCHRONOUSLY", doc)
 
     # ── 文案契约：guide() 的 TRIP AGGREGATE PAYMENT 段 ───────────────────────────────

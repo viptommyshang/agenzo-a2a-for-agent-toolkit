@@ -4,24 +4,24 @@
 ``start_token_creation`` / ``guide`` 在货币结算动作与创建网络令牌子流程上承接的默认编排三段式主路径。
 
 本文件聚焦 **R14 的默认编排三段式主路径「顺序 + 不变量」** 以及 ``guide()`` 文案：
-  - R14.1 未显式选 EVO 时，默认编排三段式主路径——**顺序**：锁单（create-order）→ 创建网络令牌
+  - R14.1 未显式选直刷绑卡时，默认编排三段式主路径——**顺序**：锁单（create-order）→ 创建网络令牌
     （独立 Payment_Session）→ 以 ``payment_token_id`` 直扣；**不变量**：令牌 ``external_transaction_id``
     == order_id、令牌权威金额 == 订单权威金额（Order_Authoritative_Amount）、两会话使用同一 member_id。
-  - R14.2 显式提供 ``payment_method_id`` → 走 EVO、**不创建网络令牌**（以「默认↔显式」决策边界的角度断言，
-    并守卫 EVO 分流不叠加创建网络令牌软引导）。
-  - R14.3 令牌主路径失败 → 返回可回退 EVO 引导，且**绝不静默改用 member/平台/开发者默认卡**（以
+  - R14.2 显式提供 ``payment_method_id`` → 走直刷绑卡、**不创建网络令牌**（以「默认↔显式」决策边界的角度断言，
+    并守卫直刷绑卡分流不叠加创建网络令牌软引导）。
+  - R14.3 令牌主路径失败 → 返回可回退到直刷绑卡的引导，且**绝不静默改用 member/平台/开发者默认卡**（以
     「失败短路成功态软引导 + 禁默认卡」的角度断言）。
   - R14.4 / R12.3 ``guide()`` 把默认编排顺序表述为规范主路径，并含三条约束文案（先锁单后创建网络令牌、
     两会话同 member、strict 订单绑定）。
 
-> 与任务 11.7（``tests/test_evo_narrowing_r9.py``）的**去重边界**：
->   - 11.7 聚焦 **R9「EVO 收窄」的分支语义**——逐条断言三个软引导键（``default_orchestration`` /
->     ``evo_orchestration`` / ``token_path_failure``）在各单点 ``act`` / ``start_token_creation``
+> 与任务 11.7（``tests/test_direct_card_charge_narrowing_r9.py``）的**去重边界**：
+>   - 11.7 聚焦 **R9「直刷绑卡收窄」的分支语义**——逐条断言三个软引导键（``default_orchestration`` /
+>     ``direct_card_charge_orchestration`` / ``token_path_failure``）在各单点 ``act`` / ``start_token_creation``
 >     调用下的**出现/缺席**与失败**环节标签**（LOCKING / MINTING / DIRECT CHARGE）及回退文案。
 >   - 本文件（11.6）**不**逐条复述那些分支/环节标签断言，而是补齐 11.7 不覆盖的维度：
 >       ① **端到端三段式集成**——用统一事件时间线断言「锁单 → 创建网络令牌 → 直扣」的**跨会话先后顺序**，
 >          且三段式的四条不变量（顺序、``external_transaction_id`` == order_id、金额相等、同 member）；
->       ② **默认↔显式 EVO 的决策边界**（同一结算动作，payload 有/无 ``payment_method_id`` → 软引导键
+>       ② **默认↔显式直刷绑卡的决策边界**（同一结算动作，payload 有/无 ``payment_method_id`` → 软引导键
 >          互斥翻转，且仅默认分支叠加三段式创建网络令牌 nudge）；
 >       ③ **失败短路**——失败态优先，短路掉成功态软引导（``payment_warning`` 等）且禁默认卡；
 >       ④ **``guide()`` 文案**（11.7 完全未触及 ``guide()``）。
@@ -160,7 +160,7 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         # 直扣成功（stage 3 携令牌凭据）→ 三类软引导均不应出现。
         self.assertNotIn("token_path_failure", charge)
         self.assertNotIn("default_orchestration", charge)
-        self.assertNotIn("evo_orchestration", charge)
+        self.assertNotIn("direct_card_charge_orchestration", charge)
         self.assertNotIn("payment_warning", charge)
 
         # ── 三段式顺序守卫（统一事件时间线）：锁单 < 创建网络令牌 < 直扣 ──────────────────────────
@@ -182,10 +182,10 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(charge_event_payload.get("payment_token_id"), minted_token_id)
         self.assertNotIn("payment_method_id", charge_event_payload)
 
-    # ── R14.1：默认选择——未显式选 EVO 的结算步默认被引导走三段式令牌主路径 ──────────────────
+    # ── R14.1：默认选择——未显式选直刷绑卡的结算步默认被引导走三段式令牌主路径 ──────────────────
     async def test_default_orchestration_advice_describes_three_stage_sequence(self) -> None:
         """现结结算动作未携任何显式支付凭据时，桥层附上「默认走独立 Network_Token 三段式主路径」的
-        编排建议——本用例聚焦断言该建议**描述了有序的三段式与其不变量**（11.7 只断言该键出现/EVO 缺席，
+        编排建议——本用例聚焦断言该建议**描述了有序的三段式与其不变量**（11.7 只断言该键出现/直刷绑卡缺席，
         不校验其三段式顺序文案，两者互补不重复）。
 
         Validates: Requirements 14.1
@@ -205,19 +205,19 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         self.assertIn("external_transaction_id", advice)
         self.assertIn("authoritative", advice)  # 令牌金额 == 订单权威金额
         self.assertIn("payment_token_id", advice)  # stage 3 携令牌直扣（而非 method）
-        # 默认（未选卡）分支必带「未选卡」强约束警告，且不与显式 EVO 分流互相叠加。
+        # 默认（未选卡）分支必带「未选卡」强约束警告，且不与显式直刷绑卡分流互相叠加。
         self.assertIn("payment_warning", out)
-        self.assertNotIn("evo_orchestration", out)
+        self.assertNotIn("direct_card_charge_orchestration", out)
         self.assertNotIn("token_path_failure", out)
 
-    # ── R14.2：默认 ↔ 显式 EVO 的「决策边界」——同一结算动作按 evo_explicit 翻转分支 ───────
-    async def test_default_vs_explicit_evo_decision_boundary(self) -> None:
-        """同一 hotel 锁后付结算动作，边界由 **evo_explicit** 划定（而非仅凭 payment_method_id）：
+    # ── R14.2：默认 ↔ 显式直刷绑卡的「决策边界」——同一结算动作按 direct_card_charge 翻转分支 ───────
+    async def test_default_vs_explicit_direct_card_charge_decision_boundary(self) -> None:
+        """同一 hotel 锁后付结算动作，边界由 **direct_card_charge** 划定（而非仅凭 payment_method_id）：
         (a) payload 无凭据 → 默认三段式令牌主路径（default_orchestration + payment_warning）；
-        (b) payload 带 payment_method_id 但**未** evo_explicit（选了已绑卡）→ 仍走默认令牌主路径
+        (b) payload 带 payment_method_id 但**未** direct_card_charge（选了已绑卡）→ 仍走默认令牌主路径
         （default_orchestration，用该卡创建网络令牌；已选卡故不挂 payment_warning）；
-        (c) payload 显式 evo_explicit=true（用户明确选直刷 EVO）→ 翻转到显式 EVO 分流
-        （evo_orchestration、不创建网络令牌）。三者软引导键互斥。
+        (c) payload 显式 direct_card_charge=true（用户明确选直刷绑卡）→ 翻转到显式直刷绑卡分流
+        （direct_card_charge_orchestration、不创建网络令牌）。三者软引导键互斥。
 
         Validates: Requirements 14.2, 14.1
         """
@@ -227,34 +227,34 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         default_out = await server.act(sid, _HOTEL_PAY[0], _HOTEL_PAY[1], {})
         self.assertIn("default_orchestration", default_out)
         self.assertIn("payment_warning", default_out)
-        self.assertNotIn("evo_orchestration", default_out)
+        self.assertNotIn("direct_card_charge_orchestration", default_out)
 
-        # (b) 带已绑卡 payment_method_id 但未显式选 EVO → 仍默认令牌主路径（用该卡创建网络令牌），
-        #     evo_orchestration 缺席；已选卡故不再挂未选卡警告。
+        # (b) 带已绑卡 payment_method_id 但未显式选直刷绑卡 → 仍默认令牌主路径（用该卡创建网络令牌），
+        #     direct_card_charge_orchestration 缺席；已选卡故不再挂未选卡警告。
         bound_out = await server.act(
             sid, _HOTEL_PAY[0], _HOTEL_PAY[1], {"payment_method_id": "pm_evo_boundary"}
         )
         self.assertIn("default_orchestration", bound_out)
-        self.assertNotIn("evo_orchestration", bound_out)
+        self.assertNotIn("direct_card_charge_orchestration", bound_out)
         self.assertNotIn("payment_warning", bound_out)
 
-        # (c) 显式 evo_explicit=true → 翻转到 EVO 兜底轨、不创建网络令牌；不叠加令牌主路径 nudge / 未选卡警告。
-        evo_out = await server.act(
+        # (c) 显式 direct_card_charge=true → 翻转到直刷绑卡兜底轨、不创建网络令牌；不叠加令牌主路径 nudge / 未选卡警告。
+        direct_out = await server.act(
             sid,
             _HOTEL_PAY[0],
             _HOTEL_PAY[1],
-            {"payment_method_id": "pm_evo_boundary", "evo_explicit": True},
+            {"payment_method_id": "pm_evo_boundary", "direct_card_charge": True},
         )
-        self.assertIn("evo_orchestration", evo_out)
-        self.assertNotIn("default_orchestration", evo_out)
-        self.assertNotIn("token_path_failure", evo_out)
-        self.assertNotIn("payment_warning", evo_out)
-        # 「不创建网络令牌」不变量：显式 EVO 结算动作全程未触发任何创建网络令牌子流程（无 payment.token-setup#submit）。
+        self.assertIn("direct_card_charge_orchestration", direct_out)
+        self.assertNotIn("default_orchestration", direct_out)
+        self.assertNotIn("token_path_failure", direct_out)
+        self.assertNotIn("payment_warning", direct_out)
+        # 「不创建网络令牌」不变量：显式直刷绑卡结算动作全程未触发任何创建网络令牌子流程（无 payment.token-setup#submit）。
         mint_actions = [
             a for a in self.fake.action_calls
             if a[1] == "payment.token-setup" and a[2] == "submit"
         ]
-        self.assertEqual(mint_actions, [], "显式 EVO 分流不得创建 Network_Token")
+        self.assertEqual(mint_actions, [], "显式直刷绑卡分流不得创建 Network_Token")
 
     # ── R14.3：令牌主路径失败 → 失败短路成功态软引导，且绝不静默改用默认卡 ──────────────────────
     async def test_main_path_failure_short_circuits_success_advice_and_forbids_default_card(
@@ -262,8 +262,8 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         """令牌主路径直扣环节失败（携 payment_token_id 的结算动作返回 failed 终态）→ 结果附
         token_path_failure 引导，并且：
-          - **短路**掉成功态软引导（不再出现 default_orchestration / evo_orchestration / payment_warning）；
-          - 引导语义**禁止静默改用 platform / developer / member 默认卡**、且回退 EVO 属客户端显式决定。
+          - **短路**掉成功态软引导（不再出现 default_orchestration / direct_card_charge_orchestration / payment_warning）；
+          - 引导语义**禁止静默改用 platform / developer / member 默认卡**、且回退到直刷绑卡属客户端显式决定。
 
         本用例从「失败优先短路 + 禁默认卡」角度断言（11.7 已逐环节断言 LOCKING/MINTING/DIRECT CHARGE
         标签，本处不重复环节标签，改为守卫失败态对成功态软引导的短路与 R14.3 的「不静默改卡」硬语义）。
@@ -279,12 +279,12 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         # 失败态优先：只挂 token_path_failure，短路掉所有成功态软引导。
         self.assertIn("token_path_failure", out)
         self.assertNotIn("default_orchestration", out)
-        self.assertNotIn("evo_orchestration", out)
+        self.assertNotIn("direct_card_charge_orchestration", out)
         self.assertNotIn("payment_warning", out)
 
         advice = out["token_path_failure"]
-        # R14.3 硬语义：可回退 EVO 但须客户端显式决定；绝不静默改用平台/开发者/会员默认卡。
-        self.assertIn("EVO", advice)
+        # R14.3 硬语义：可回退到直刷绑卡但须客户端显式决定；绝不静默改用平台/开发者/会员默认卡。
+        self.assertIn("bound-card direct charge", advice)
         self.assertIn("EXPLICIT decision", advice)
         self.assertIn("NEVER silently fall back", advice)
         # 实现文案用大写 DEFAULT，这里大小写无关地守卫「默认卡」措辞。
@@ -308,8 +308,8 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         self.assertIn("THREE-STAGE", text)
         self.assertIn("→ MINT SECOND", text)
         self.assertIn("→ CHARGE", text)
-        # 明确 EVO 不是默认，仅显式/回退。
-        self.assertIn("EVO preauth+capture is NOT the default", text)
+        # 明确直刷绑卡不是默认，仅显式/回退。
+        self.assertIn("PREAUTH+CAPTURE ON A BOUND CARD is NOT the default", text)
 
         # 三条约束（R12.3 / R14.4）——三条均须出现。
         self.assertIn("LOCK FIRST, MINT SECOND", text)              # ① 先锁单后创建网络令牌
@@ -345,7 +345,7 @@ class DefaultOrchestrationR14Test(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("default_orchestration", out)
         self.assertNotIn("payment_warning", out)
-        self.assertNotIn("evo_orchestration", out)
+        self.assertNotIn("direct_card_charge_orchestration", out)
         self.assertNotIn("token_path_failure", out)
 
     # ── 辅助 ─────────────────────────────────────────────────────────────────────

@@ -41,8 +41,8 @@ schema-driven, new domains (added as orchestrator schemas) work here with **no c
 
 > **Routing behind a gateway.** `AGENZO_A2A_BASE_URL` must reach orchestrator-base on **two**
 > surfaces: `/a2a/*` (conversation, Bearer token) and `/orch-public/*` (auth-free: agent onboarding
-> `register`/`token`, ride geocoding tools `resolve_location`/`resolve_pickup_time`, and the EVO
-> Drop-in page). The client obtains its token via `POST /orch-public/auth/token`, so onboarding and
+> `register`/`token`, ride geocoding tools `resolve_location`/`resolve_pickup_time`, and the hosted
+> drop-in card-binding page). The client obtains its token via `POST /orch-public/auth/token`, so onboarding and
 > conversation land on the **same** service and the token verifies. When deploying behind a public
 > gateway, proxy **both** prefixes to orchestrator-base (a human-login `/api/v1/auth/*` gateway route
 > may point at a different orchestrator and is not used by this client).
@@ -153,13 +153,31 @@ A2A `contextId` is reused for the whole session (`start_payment` opens a separat
 
 ## Payment notes
 
-Payment runs in its own session. `start_payment` returns your ACTIVE cards; **EVO** cards
-(Visa/Mastercard) are used directly by `payment_method_id`, while **UnionPay** cards go through a
+Payment runs in its own session. `start_payment` returns your ACTIVE cards; **Visa / Mastercard**
+cards are used directly by `payment_method_id`, while **UnionPay** cards go through a
 `checkout_url` passkey (Kiro opens it via `open_url`, you complete it, then it polls to `ACTIVE`
 and gets a `payment_token_id`). The resulting id is attached to the booking `confirm`.
+
+### Breaking change — field names (settle a bound card directly)
+
+This example now uses the current field names, and the orchestrator accepts only these:
+
+| Name | Where |
+|---|---|
+| `direct_card_charge` | settle (`pay` / `confirm` / `checkout`) payload — explicit opt-in to charge a bound card directly instead of minting a network token |
+| `card_route` | standalone payment entry card — picks the sub-path (four values unchanged) |
+| `direct_card_charge_orchestration` | result key of `act(...)` in **this bridge** |
+
+The last key is produced by this example bridge, not by the orchestrator contract: it carries the
+non-blocking advice for an explicit direct charge on a bound card (mutually exclusive with
+`default_orchestration`). If your agent branches on that key, read this name.
+
+The predecessors of the first two names are listed with the full old→new mapping in the
+orchestrator's own contract changelog (the `修订记录` section of its a2a docs portal) — that
+changelog, not this README, is the authoritative migration note.
 
 Security: this is a client only — it adds no network-exposed endpoints. It talks to the
 orchestrator on two surfaces: the **conversation** surface `/a2a/*` with a short-lived Bearer token
 (obtained via the auth-free `/orch-public/auth/token`), and the **auth-free** `/orch-public/*`
-surface (onboarding, ride geocoding, EVO Drop-in page). It can also open your browser for
+surface (onboarding, ride geocoding, hosted drop-in card-binding page). It can also open your browser for
 checkout / card enrollment. The Bearer token is issued by orchestrator-base and only sent to it.

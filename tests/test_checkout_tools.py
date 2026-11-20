@@ -134,7 +134,7 @@ class CheckoutToolsTest(unittest.IsolatedAsyncioTestCase):
         out = await server.checkout("https://merchant.example.com/cart/1:1", _SHIPPING, _CARD)
         self.fake.queue_action_response(200, _task_json([_await_card()]))
         res = await server.act(out["session_id"], "checkout.confirm", "confirm", {})
-        for key in ("default_orchestration", "payment_warning", "evo_orchestration"):
+        for key in ("default_orchestration", "payment_warning", "direct_card_charge_orchestration"):
             self.assertNotIn(key, res)
         self.assertEqual(res["cards"][-1]["component"], "checkout.await")
 

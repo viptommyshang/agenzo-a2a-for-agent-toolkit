@@ -292,7 +292,7 @@ class FlowIdSpansBothSessionsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fake.flow_calls, ["start_new", "ensure"])
 
     async def test_start_payment_also_reuses_the_flow(self) -> None:
-        """显式 / 回退的 EVO 轨同样沿用，不另起一条旅程。"""
+        """显式 / 回退的直刷绑卡轨同样沿用，不另起一条旅程。"""
         booking = await server.book("book a hotel", member_id="m-shared")
         payment = await server.start_payment(
             amount_cents=14731, recipient_name="Kevin Zhang", member_id="m-shared"
