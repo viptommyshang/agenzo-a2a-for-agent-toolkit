@@ -1259,7 +1259,7 @@ async def start_payment(
             **unified card-entry page**. Submit ``{}`` and open the returned
             ``link_url``: the cardholder types the card there and **the page itself routes by the
             card's BIN** — Visa (4…) runs the native VTS + Payment Passkey rail, any other brand
-            (Mastercard, …) runs the acquirer-gateway rail. So you do NOT need to know the brand up front, and there is
+            (Mastercard, …) runs the acquiring-gateway rail. So you do NOT need to know the brand up front, and there is
             nothing to pass for "Visa" vs "Mastercard".
         ⚠️ Omitting ``brand`` does **NOT** default to UnionPay — it goes to the unified card page.
         To bind a UnionPay card you MUST pass ``brand:"unionpay"`` explicitly. (Legacy note: any
@@ -1374,12 +1374,13 @@ async def start_token_creation(
     poll to ACTIVE), Visa (``open_url`` payment_url FIDO passkey → poll to ACTIVE), or Mastercard
     (SYNCHRONOUS — no browser step).
 
-    ``token_credential`` (optional, NOT applicable to UnionPay cards; when omitted the platform picks
-    by the card's actual capability, defaulting to ``network_token``) picks WHICH
-    CREDENTIAL the minted token carries, and that choice decides whether the LATER charge is silent:
+    ``token_credential`` (optional) picks WHICH CREDENTIAL the minted token carries, and that choice
+    decides whether the LATER charge is silent. Not applicable to UnionPay cards. A card that does not
+    support gateway tokens ignores this field and is minted in that card's own default way. When
+    omitted the platform picks by the card's actual capability, defaulting to ``network_token``.
       · omitted / ``"network_token"`` (DEFAULT, unchanged behaviour) — mints a cryptogram-bearing
         network token; the charge goes out as ``paymentMethod.type=networkToken``.
-      · ``"gateway_token"`` — mints NOTHING: the token carries the card's own acquirer-gateway (COF) token
+      · ``"gateway_token"`` — mints NOTHING: the token carries the card's own acquiring-gateway (COF) token
         and NO cryptogram, so the charge goes out as ``paymentMethod.type=token`` and settles in ONE
         call with **NO 3DS page and NO browser step**.
     ``dynamic_data_type`` (optional, VISA cards ONLY — ignored for UnionPay/EVO) picks WHICH one-time
@@ -1588,7 +1589,7 @@ def open_url(url: str) -> dict[str, Any]:
     action has ``dispatch:"client"`` + ``capability:"open_url"``: UnionPay checkout (passkey),
     UnionPay card-enrollment (``enroll_url``), and the **unified card-entry page** (``link_url``,
     hosted by the platform) where the cardholder types any Visa/Mastercard and the page routes by
-    the card's BIN (Visa → VTS + Payment Passkey; other brands → the acquirer-gateway rail). The MCP server runs on the
+    the card's BIN (Visa → VTS + Payment Passkey; other brands → the acquiring-gateway rail). The MCP server runs on the
     user's machine, so this pops the page for the user to complete the passkey/enrollment/card
     entry. After they finish, drive the next card (e.g. "paid" then "poll", or "bound" then "poll").
 
@@ -1858,7 +1859,7 @@ PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (ow
     1. NETWORK TOKEN — the DEFAULT. Mint a cryptogram-bearing token from the card and settle in one
        call: no browser step, no 3DS page. Take it whenever the user states no preference.
     2. GATEWAY TOKEN, SILENT — mint with token_credential="gateway_token". The token carries the
-       card's own acquirer-gateway (COF) token and NO cryptogram, so the charge settles as
+       card's own acquiring-gateway (COF) token and NO cryptogram, so the charge settles as
        paymentMethod.type=token in ONE call with NO 3DS page and NO browser step. Take this
        whenever the user says 'gateway token' / silent / unattended / 'no browser page' / virtual
        card — and also when the card has NO network token at all (a frictionless binding yields
@@ -1967,13 +1968,16 @@ PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (ow
     tokens are "UnionPay-only", and do NOT steer them to add a UnionPay card just to mint one — any
     listed card (including a Mastercard) can be minted. The "only UnionPay mints, Visa / Mastercard
     handed back" rule applies ONLY to paying an order via the start_payment picker.
-  • SILENT vs 3DS IS DECIDED AT MINT TIME — ``token_credential`` (not applicable to UnionPay cards).
+  • SILENT vs 3DS IS DECIDED AT MINT TIME — ``token_credential``. Not applicable to UnionPay cards. A
+    card that does not support gateway tokens ignores this field and is minted in that card's own
+    default way. When omitted the platform picks by the card's actual capability, defaulting to
+    ``network_token``.
     start_token_creation takes an optional ``token_credential`` choosing WHICH credential the minted
     token carries, and that fixes the on-wire rail for EVERY later charge of it (including a merchant
     order's pay):
       – omitted / "network_token" (DEFAULT, unchanged) — a cryptogram-bearing network token, charged
         as paymentMethod.type=networkToken;
-      – "gateway_token" — mints NOTHING: the token carries the card's own acquirer-gateway (COF) token and
+      – "gateway_token" — mints NOTHING: the token carries the card's own acquiring-gateway (COF) token and
         NO cryptogram, charged as paymentMethod.type=token, settling in ONE call with NO 3DS page and
         NO browser step.
     This is RAIL 2 of the three above. network_token stays the DEFAULT when the user states no
