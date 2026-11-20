@@ -70,8 +70,11 @@ raw A2A protocol:
 from __future__ import annotations
 
 import json
+import re
 import webbrowser
+from datetime import datetime
 from typing import Any
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
@@ -199,6 +202,50 @@ def _ctx(session_id: str) -> str:
     return s["context_id"] if s else session_id
 
 
+# 代下单会话 → 本工具生成的幂等键（同一会话内的 act 沿用，见 :func:`act`）。
+_checkout_keys: dict[str, str] = {}
+
+
+def _new_checkout_key(checkout_url: str) -> str:
+    """``<merchant>-<uuid4>``：每次新订单一个全新的键，不含任何卡信息。"""
+    host = (urlparse(str(checkout_url or "")).hostname or "").removeprefix("www.")
+    merchant = re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-")[:40] or "checkout"
+    return f"{merchant}-{uuid4().hex}"
+
+
+_ISO_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
+
+
+def _local_time(epoch: float) -> str:
+    """epoch 秒 → 本机本地时间 ``YYYY-MM-DD HH:MM``（给用户看，不用 UTC）。"""
+    return datetime.fromtimestamp(epoch).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _localize_iso(text: str) -> str:
+    """文字里的 ISO 时间（服务端写的是 UTC）改成本机本地时间。"""
+    return _ISO_TS_RE.sub(
+        lambda m: _local_time(datetime.fromisoformat(m.group().replace("Z", "+00:00")).timestamp()), text
+    )
+
+
+def _localize_checkout_times(out: dict[str, Any]) -> None:
+    """把代下单卡片里的 ``created_at``（epoch 秒）和说明句里的 UTC 时间改成本机本地时间。"""
+    for card in out.get("cards") or []:
+        data = card.get("data") if isinstance(card, dict) else None
+        if not isinstance(data, dict) or not str(card.get("component", "")).startswith("checkout."):
+            continue
+        created = data.get("created_at")
+        if isinstance(created, (int, float)) and not isinstance(created, bool):
+            local = _local_time(float(created))
+            out["text"] = str(out.get("text", "")).replace(str(created), local)
+            data["created_at"] = local
+        errors = data.get("errors")
+        if isinstance(errors, list):
+            data["errors"] = [_localize_iso(e) if isinstance(e, str) else e for e in errors]
+        if isinstance(out.get("text"), str):
+            out["text"] = _localize_iso(out["text"])
+
+
 def _result(session_id: str, status: int, raw: str) -> dict[str, Any]:
     """Normalize an A2A response into a chat-friendly dict (or an error).
 
@@ -237,6 +284,7 @@ def _result(session_id: str, status: int, raw: str) -> dict[str, Any]:
         out = normalize_task(task, heavy_keys=frozenset())
     out["session_id"] = session_id
     out["member_id"] = _get_bridge().member_id
+    _localize_checkout_times(out)
     # flow_id —— 这一次用户任务的关联键，跨订单会话与支付会话、跨所有服务（含异步记账）都是
     # 同一个值。放进每次工具返回，调用方排障时可以直接报出来，不必去翻日志反推。
     flow_id = _get_bridge().flow_id
@@ -1045,6 +1093,10 @@ async def act(session_id: str, component: str, action: str, payload: dict[str, A
     prefill = _form_prefill(session_id, component)
     if prefill:
         payload = {**prefill, **payload}
+    # 代下单：同一会话里重提入口表单（缺字段补齐 / edit 后重提）沿用本会话已生成的幂等键，
+    # 绝不让模型自己编一个。
+    if component == "checkout.setup" and action == "submit" and session_id in _checkout_keys:
+        payload = {**payload, "idempotency_key": _checkout_keys[session_id]}
     # Swap any short token handle the model copied from a slimmed card back to the real opaque token
     # before it goes on the wire (no-op if this session minted no handles). Done first so both the
     # A2A call and the soft-guidance below see the real payment_token_id / product_token.
@@ -1282,8 +1334,20 @@ async def start_token_creation(
     payment_method_id: str = "",
     provider_id: str | None = None,
     token_credential: str = "",
+    dynamic_data_type: str = "",
 ) -> dict[str, Any]:
     """Mint a REUSABLE Network_Token in an INDEPENDENT payment session (create-token scenario).
+
+    The token is a NETWORK token issued by the card network (Visa for a Visa card) for the USER'S OWN
+    bound card — it is not Agenzo-only. Paying a hotel / flight / ride order through Agenzo is just ONE
+    of its uses; it can equally be typed into an external merchant's checkout page.
+
+    TALK TO THE USER IN PLAIN WORDS ONLY. Never say DAVV, TAVV, cryptogram, "dynamic data type",
+    passkey, FIDO, or a card-network name (Visa etc.) to the user — those words are INTERNAL
+    parameter values / rail details. Do not announce the confirmation step in advance; only when you
+    are really about to open the confirm page, say just: "会打开一个确认页，按提示用指纹或面容确认就行"
+    (or the same in the user's language). When the token is ready, say only that you are giving the card
+    number, expiry and security code, which can be filled straight into the merchant's checkout page.
 
     This is the token-minting entry point for the token-first flow: it opens a SEPARATE A2A context
     (a Payment_Session, isolated from any Booking_Session) and drives the ``create-token`` scenario,
@@ -1307,6 +1371,24 @@ async def start_token_creation(
       · ``"gateway_token"`` — mints NOTHING: the token carries the card's own EVO gateway (COF) token
         and NO cryptogram, so the charge goes out as ``paymentMethod.type=token`` and settles in ONE
         call with **NO 3DS page and NO browser step**.
+    ``dynamic_data_type`` (optional, VISA cards ONLY — ignored for UnionPay/EVO) picks WHICH one-time
+    data the Visa token carries; omitted = ``"TAVV"``. Choose it from what the user will DO with the token:
+      · the user ALREADY said it is for ordering online / filling an external merchant's checkout page
+        (e.g. "帮我生成一个网络令牌，用来网上下单") → pass ``"DAVV"`` and do NOT ask again. The result
+        (``payment.token-result``) then returns the token card number (``networkToken.value``), expiry
+        (``networkToken.expiryDate``, MMYY) and a 3-digit dynamic CVV (``networkToken.cvv``) to type into
+        that page; the user never has to say "DAVV".
+      · the purpose is UNCLEAR → ASK the user first, in plain words, e.g. "这个令牌是拿卡号去网站上自己填
+        卡付款，还是在我们这里直接付酒店、机票、打车？"; then pass their choice: "自己去网站填卡" → DAVV
+        (take the token's card number + expiry + CVV to an external merchant and fill them in); "在这里
+        直接付" → TAVV (a cryptogram Agenzo itself uses to charge: hotel / flight / ride orders,
+        charge-by-token). Never put the words DAVV / TAVV in the question. One type per token; mint
+        again for the other.
+    AMOUNT IS IN US DOLLARS ONLY (there is no currency option). If the user gave no amount, ask ONLY for
+    the amount and say it is in dollars, e.g. "要生成多少美元的？". If the user names another currency
+    (e.g. "100港币"), tell them that for now the token can only be made in US dollars and ask for a
+    dollar amount; do NOT convert it with an exchange rate yourself. Whenever you mention the amount
+    to the user (question, confirmation, result), include "美元" (US dollars).
     RAIL PRIORITY (see the guide's THREE SETTLEMENT RAILS): ``network_token`` is the DEFAULT for a
     user who states no preference. Pass ``gateway_token`` whenever the user ASKS for a 'gateway token'
     / silent / unattended / virtual-card payment, and also when the card has NO network token (a
@@ -1469,6 +1551,10 @@ async def start_token_creation(
         # 不该变成一次被拒的建币。取值拼错时平台会显式 INVALID_REQUEST，不会静默回落。
         if token_credential:
             submit_payload["token_credential"] = token_credential
+        # Visa 令牌带哪种一次性动态数据（TAVV 缺省 / DAVV 3 位动态 CVV）。字段名与 base 的
+        # create-token a2a_input_schema 一致；空 = 不声明，由编排器/平台落缺省 TAVV。
+        if dynamic_data_type:
+            submit_payload["dynamic_data_type"] = dynamic_data_type
         status, raw = await bridge.send_action(
             _ctx(sid),
             "payment.token-setup",
@@ -1581,7 +1667,6 @@ async def checkout(
     checkout_url: str,
     shipping: dict[str, Any],
     card: dict[str, Any],
-    idempotency_key: str,
     member_id: str = "",
 ) -> dict[str, Any]:
     """**MERCHANT CHECKOUT** — place an order on a merchant's Shopify checkout page with a card the
@@ -1596,46 +1681,49 @@ async def checkout(
       zip_code}`` required; ``address2`` and ``state`` optional (US merchant pages need ``state``).
     - ``card``: ``{number, expiry ("MM/YY"), cvv, name}`` required; ``brand`` optional
       (``visa`` | ``mastercard``, default ``visa``). Any card source is fine.
-    - ``idempotency_key``: REQUIRED, chosen by YOU (the caller); this tool never generates or fills
-      one, and an empty/blank value is rejected without contacting the platform. Make it once per
-      order (e.g. your own order number) and keep it for the life of that order. After a timeout or
-      network error, resend with the SAME key: per the platform code (orchestrator ``a2a_verbs.py``
-      ``submit_checkout``) the same key within your account returns the existing task with
-      ``replayed: true`` instead of creating a second one. Use a NEW key only for a genuinely new
-      order. Never mint a fresh key just to "retry" an order that may already be placed.
-      ``checkout_status`` also accepts the key in place of ``task_id``.
-      Unconfirmed: the platform's reply when a repeated key carries different shipping/card/URL on
-      the A2A path (the code checked returns the old task without comparing contents; the REST path
-      rejects it as a conflict) — do not rely on changing details under a reused key.
+    - The idempotency key is GENERATED BY THIS TOOL (``<merchant>-<uuid>``, unique per call) and
+      returned as ``idempotency_key`` in the result — NEVER make one up and never pass one in. Every
+      call is a NEW order with a fresh key. To look the order up later, or to continue the SAME order,
+      use the returned ``idempotency_key`` or ``task_id`` (``checkout_status`` accepts either); ``act``
+      calls in this session (confirm, edit → resubmit, retry) automatically keep the same key.
+      If the result carries ``replayed: true`` (``created_at`` = local time the original order was
+      submitted; ``errors[0]`` says so), you MUST tell the user plainly, with that LOCAL time (never
+      UTC): "这是之前（<本地时间>）那笔订单的结果，这次没有重新下单" — never present it as the outcome of
+      a new order. ``IDEMPOTENCY_CONFLICT`` means the key was already used for a different order:
+      nothing was submitted; call this tool again (it makes a new key).
 
     Then drive the returned cards with ``act(session_id, ...)``:
       1) ``checkout.confirm`` shows merchant, shipping and card last 4 (no amount). Show it to the
          USER and send ``confirm`` ONLY after they agree — it really submits the order and cannot be
          undone. ``edit`` goes back to the form BEFORE any task exists (the platform only creates the
-         task at ``confirm``); resubmit it (or call this tool again) with the full payload incl.
-         ``card`` and keep the SAME ``idempotency_key`` for this order. ``cancel`` ends without ordering.
+         task at ``confirm``); resubmit it with ``act(session_id, "checkout.setup", "submit", ...)``
+         and the full payload incl. ``card`` (the key is kept for you). ``cancel`` ends without ordering.
       2) ``checkout.await``: send ``poll`` with ``{"task_id": ...}`` every ~5 s; it usually takes
          20–130 s. Set your own limit (~5 min).
       3) ``checkout.result``: ``status`` tells the outcome. ``payment-reached`` = submitted to the
-         merchant's payment gateway (read ``errors``/``order_id``). Only ``captcha-failed`` offers
+         merchant's payment gateway, whether or not it succeeded — ``success`` is the verdict: ``true``
+         ONLY when the order was really placed; ``false`` (with ``payment-reached``) means it was NOT
+         placed (usually declined). READ THE OUTCOME like this and tell the user in plain words:
+         ``success: true`` / ``order_id`` present → the order was placed; ``errors[0]``
+         is a ready-made sentence for every other case — "declined; no order was placed and nothing
+         was charged" → say the payment was declined and offer another card; "still processing" → do
+         NOT retry, tell the user to check the merchant's order email/page; "not submitted" → nothing
+         was charged; "no clear result" → the order may or may not exist, check with the merchant
+         before any retry. The remaining ``errors`` entries are the merchant's own words. Only ``captcha-failed`` offers
          ``retry`` (send ``task_id`` + the full ``card`` again; the retry action carries no
          ``idempotency_key`` — per the platform flow the retry submit takes only the new card
          reference, so the retry task is deduplicated on that, not on your key; whether a custom key
          can be sent on retry is unconfirmed). For ``timeout``/``script-error`` the
          order MAY have been placed — do NOT retry; check with the merchant.
-    If fields are missing, the form comes back with text listing them; fix and call this tool again
-    with the same ``idempotency_key``."""
-    if not isinstance(idempotency_key, str) or not idempotency_key.strip():
-        return {
-            "error": "missing required parameter: idempotency_key (non-empty, chosen by the caller, "
-                     "one per order; reuse the same value when resending)",
-            "cards": [], "text": "",
-        }
+    If fields are missing, the form comes back with text listing them; fix them and resubmit with
+    ``act(session_id, "checkout.setup", "submit", ...)`` (the key is kept) — no task exists yet."""
+    idempotency_key = _new_checkout_key(checkout_url)
     bridge = _get_bridge()
     if member_id:
         await bridge.set_member(member_id)
     bridge.start_new_flow()
     sid = _new_session("checkout")
+    _checkout_keys[sid] = idempotency_key
     payload = {
         "checkout_url": checkout_url,
         "shipping": dict(shipping or {}),
@@ -1646,7 +1734,9 @@ async def checkout(
         status, raw = await bridge.send_action(_ctx(sid), "checkout.setup", "submit", payload)
     except AuthError as exc:
         return {"session_id": sid, "error": f"auth failed: {exc}", "cards": [], "text": ""}
-    return _result(sid, status, raw)
+    out = _result(sid, status, raw)
+    out["idempotency_key"] = idempotency_key
+    return out
 
 
 @mcp.tool()
