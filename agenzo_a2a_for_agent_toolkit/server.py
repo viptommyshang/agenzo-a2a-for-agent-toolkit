@@ -1374,7 +1374,8 @@ async def start_token_creation(
     poll to ACTIVE), Visa (``open_url`` payment_url FIDO passkey → poll to ACTIVE), or Mastercard
     (SYNCHRONOUS — no browser step).
 
-    ``token_credential`` (optional, Mastercard cards ONLY — ignored for UnionPay/Visa) picks WHICH
+    ``token_credential`` (optional, NOT applicable to UnionPay cards; when omitted the platform picks
+    by the card's actual capability, defaulting to ``network_token``) picks WHICH
     CREDENTIAL the minted token carries, and that choice decides whether the LATER charge is silent:
       · omitted / ``"network_token"`` (DEFAULT, unchanged behaviour) — mints a cryptogram-bearing
         network token; the charge goes out as ``paymentMethod.type=networkToken``.
@@ -1966,7 +1967,7 @@ PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (ow
     tokens are "UnionPay-only", and do NOT steer them to add a UnionPay card just to mint one — any
     listed card (including a Mastercard) can be minted. The "only UnionPay mints, Visa / Mastercard
     handed back" rule applies ONLY to paying an order via the start_payment picker.
-  • SILENT vs 3DS IS DECIDED AT MINT TIME — ``token_credential`` (Mastercard cards only).
+  • SILENT vs 3DS IS DECIDED AT MINT TIME — ``token_credential`` (not applicable to UnionPay cards).
     start_token_creation takes an optional ``token_credential`` choosing WHICH credential the minted
     token carries, and that fixes the on-wire rail for EVERY later charge of it (including a merchant
     order's pay):
