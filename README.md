@@ -167,10 +167,13 @@ This example now uses the current field names, and the orchestrator accepts only
 | `direct_card_charge` | settle (`pay` / `confirm` / `checkout`) payload — explicit opt-in to charge a bound card directly instead of minting a network token |
 | `card_route` | standalone payment entry card — picks the sub-path (four values unchanged) |
 | `direct_card_charge_orchestration` | result key of `act(...)` in **this bridge** |
+| `card_3ds` | value of `settlement_rails.offer_in_this_order[2].rail` returned by **this bridge** (was `evo_3ds`) |
 
-The last key is produced by this example bridge, not by the orchestrator contract: it carries the
-non-blocking advice for an explicit direct charge on a bound card (mutually exclusive with
-`default_orchestration`). If your agent branches on that key, read this name.
+The last two names are produced by this example bridge, not by the orchestrator contract. The
+result key carries the non-blocking advice for an explicit direct charge on a bound card (mutually
+exclusive with `default_orchestration`). The `rail` value sits in the `settlement_rails` dict that
+every tool result with a money-settling action carries — if your agent branches on either name,
+read these.
 
 The predecessors of the first two names are listed with the full old→new mapping in the
 orchestrator's own contract changelog (the `修订记录` section of its a2a docs portal) — that
