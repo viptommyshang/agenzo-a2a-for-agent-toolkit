@@ -1383,7 +1383,7 @@ async def start_token_creation(
       · ``"gateway_token"`` — mints NOTHING: the token carries the card's own acquiring-gateway (COF) token
         and NO cryptogram, so the charge goes out as ``paymentMethod.type=token`` and settles in ONE
         call with **NO 3DS page and NO browser step**.
-    ``dynamic_data_type`` (optional, VISA cards ONLY — ignored for UnionPay/EVO) picks WHICH one-time
+    ``dynamic_data_type`` (optional, VISA cards ONLY — ignored for UnionPay / Mastercard) picks WHICH one-time
     data the Visa token carries; omitted = ``"TAVV"``. Choose it from what the user will DO with the token:
       · the user ALREADY said it is for ordering online / filling an external merchant's checkout page
         (e.g. "帮我生成一个网络令牌，用来网上下单") → pass ``"DAVV"`` and do NOT ask again. The result
