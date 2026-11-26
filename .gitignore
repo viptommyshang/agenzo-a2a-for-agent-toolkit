@@ -7,5 +7,11 @@ __pycache__/
 .env
 *.local
 
+# Git worktrees (created by `git worktree add`; local-only, never committed).
+# Without this, `git status --porcelain` always reports `?? .worktrees/`, which
+# makes tooling that treats a non-empty porcelain output as "dirty" refuse to
+# pull — even when no tracked file has changed.
+.worktrees/
+
 # OS
 .DS_Store
