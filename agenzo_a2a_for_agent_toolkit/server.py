@@ -17,7 +17,7 @@ like any other scenario (no code changes here):
     (``payment.pay-confirm``) shows amount + currency — you MUST get the USER's explicit ``confirm``
     before any money moves. Routing follows the chosen card's brand, same generic loop: UnionPay →
     ``payment.action-required`` (``open_url`` passkey → ``paid`` → poll) then the charge is captured
-    and ``payment.pay-result`` is returned; Mastercard/EVO → ``payment.card-action-required``
+    and ``payment.pay-result`` is returned; Mastercard → ``payment.card-action-required``
     (``open_url`` 3DS → ``paid`` → ``poll`` ``payment.card-await`` until terminal) then
     ``payment.card-result``. A successful charge returns a ``charge_no`` — keep it for refunds.
   - **refund** (``refund`` scenario): give the ``charge_no`` (or ``payment_token_id``) and an optional
@@ -28,10 +28,10 @@ like any other scenario (no code changes here):
     ``payment_method_id`` to ``start_token_creation`` to skip the picker), then it is minted by the
     CARD BRAND on ALL THREE
     rails: UnionPay (``open_url`` checkout passkey → poll to ACTIVE), Visa (``open_url`` payment_url
-    FIDO passkey → poll to ACTIVE), or EVO/Mastercard (SYNCHRONOUS — no browser step). No charge
+    FIDO passkey → poll to ACTIVE), or Mastercard (SYNCHRONOUS — no browser step). No charge
     and no ``charge_no`` occur; ``payment.token-result`` returns the ``payment_token_id`` (+ status).
     NOTE: minting is NOT UnionPay-only here — EVERY listed brand mints. (This differs from
-    ``start_payment`` / ``pay``, where only UnionPay mints and EVO/Visa are handed back as a
+    ``start_payment`` / ``pay``, where only UnionPay mints and Visa / Mastercard are handed back as a
     ``payment_method_id``.)
 Never auto-confirm a funds action (pay/refund) — always surface the confirm card's amount to the
 user and only send ``confirm`` after they approve. Drive the whole sub-flow with structured
@@ -391,7 +391,7 @@ _NON_SETTLE_COMPONENT_HINTS = ("cancel", "refund", "void", "check-out", "pay-con
 def _is_settle_action(session_id: str, component: str, action: str) -> bool:
     """判断本次卡片动作是否为「会实际扣款/收钱」的货币结算动作。
 
-    这是 ``_settle_without_payment`` 与显式 EVO 分流（``_explicit_evo_no_mint``）共用的结算动作判定，
+    这是 ``_settle_without_payment`` 与显式直刷绑卡分流（``_explicit_direct_card_charge_no_mint``）共用的结算动作判定，
     抽取出来保证两处口径完全一致、避免漂移。
 
     判据按优先级：
@@ -433,33 +433,34 @@ def _settle_without_payment(session_id: str, component: str, action: str, payloa
     return not any(str((payload or {}).get(f) or "").strip() for f in _PAYMENT_FIELDS)
 
 
-def _evo_explicit(payload: dict[str, Any]) -> bool:
-    """本次结算 payload 是否**显式声明**用户选择了 EVO 直扣兜底轨（``evo_explicit`` 为真）。
+def _direct_card_charge_requested(payload: dict[str, Any]) -> bool:
+    """本次结算 payload 是否**显式声明**用户选择了直刷绑卡兜底轨（``direct_card_charge`` 为真）。
 
-    这是「显式 EVO」的**唯一**判据（R16 EVO_Explicit_Opt_In）——单凭 payload 里有 ``payment_method_id``
-    （即选了一张已绑卡）**不**构成显式 EVO：那种情况的默认应是「用这张卡create Network_Token 再以
-    payment_token_id 直扣」，而非 EVO 预授权+捕获直扣。只有用户**明确**表示「直接刷这张 EVO 卡、
-    不走网络令牌」时，agent 才应在 payload 置 ``evo_explicit=true``。接受布尔或其字符串形态。"""
-    v = (payload or {}).get("evo_explicit")
+    这是「显式直刷绑卡」的**唯一**判据（R16 Direct_Card_Charge_Opt_In）——单凭 payload 里有
+    ``payment_method_id``（即选了一张已绑卡）**不**构成显式直刷：那种情况的默认应是「用这张卡
+    create Network_Token 再以 payment_token_id 直扣」，而非预授权 + 捕获直扣。只有用户**明确**表示
+    「直接刷这张绑卡、不走网络令牌」时，agent 才应在 payload 置 ``direct_card_charge=true``。接受
+    布尔或其字符串形态。"""
+    v = (payload or {}).get("direct_card_charge")
     if isinstance(v, bool):
         return v
     return str(v or "").strip().lower() in ("true", "1", "yes", "on")
 
 
 def _needs_token_mint(session_id: str, component: str, action: str, payload: dict[str, Any]) -> bool:
-    """默认令牌主路径触发判据：本次是货币结算动作、**未**携带 payment_token_id、且**未**显式选 EVO
-    （``evo_explicit`` 非真）。
+    """默认令牌主路径触发判据：本次是货币结算动作、**未**携带 payment_token_id、且**未**显式选直刷绑卡
+    （``direct_card_charge`` 非真）。
 
     覆盖两种情形，二者的默认都应是「先create Network_Token 再以 payment_token_id 直扣」：
       ① payload 完全无支付凭据（尚未选卡）；
-      ② payload 带 ``payment_method_id``（已选/已有一张绑卡）但**未**显式选 EVO —— 已有卡**不**是跳过
-         创建网络令牌的理由，应用**这张卡**创建网络令牌（在 create-token 流程里选它，无需重新绑卡）。
-    仅当已携带 payment_token_id（正走令牌直扣）或显式选了 EVO（``evo_explicit=true``）时不触发。"""
+      ② payload 带 ``payment_method_id``（已选/已有一张绑卡）但**未**显式选直刷绑卡 —— 已有卡**不**是
+         跳过创建网络令牌的理由，应用**这张卡**创建网络令牌（在 create-token 流程里选它，无需重新绑卡）。
+    仅当已携带 payment_token_id（正走令牌直扣）或显式选了直刷绑卡（``direct_card_charge=true``）时不触发。"""
     if not _is_settle_action(session_id, component, action):
         return False
     p = payload or {}
     has_token = bool(str(p.get("payment_token_id") or "").strip())
-    return not has_token and not _evo_explicit(p)
+    return not has_token and not _direct_card_charge_requested(p)
 
 
 _PAYMENT_WARNING = (
@@ -477,16 +478,18 @@ _PAYMENT_WARNING = (
 # ─────────────────────────────────────────────────────────────────────────────
 # 方案 A 软引导：默认编排令牌现结三段式主路径（R14.1、R6.1/R6.2/R6.3）
 # ─────────────────────────────────────────────────────────────────────────────
-# 现结订单在「未显式提供 payment_method_id（未选 EVO 卡）」时，MCP 桥的默认编排不再回退到
-# EVO / 平台默认卡，而是走「独立 Network_Token 现结」这条规范主路径：先锁单 → 独立 Payment_Session
+# 现结订单在「未显式提供 payment_method_id（未选绑卡）」时，MCP 桥的默认编排不再回退到
+# 直刷绑卡 / 平台默认卡，而是走「独立 Network_Token 现结」这条规范主路径：先锁单 → 独立 Payment_Session
 # 创建网络令牌 → 回 Booking_Session 以 payment_token_id 直扣。该默认属**软引导**——桥层不做硬拦截，仅在
 # 货币结算动作上附一条非阻塞的编排建议，指引 agent 按三段式顺序推进；动作本身仍照常转发给编排器。
 _DEFAULT_TOKEN_ORCHESTRATION = (
     "DEFAULT ORCHESTRATION (soft guidance): this pay-per-call settle step carries NO explicit, "
-    "user-chosen payment_method_id (EVO card) and NO payment_token_id. The DEFAULT main path is an "
-    "INDEPENDENT Network_Token direct charge — and it MUST be MINTED FIRST, BEFORE you settle.\n"
+    "user-chosen payment_method_id (a bound card) and NO payment_token_id. The DEFAULT main path "
+    "is an INDEPENDENT Network_Token direct charge — and it MUST be MINTED FIRST, BEFORE you "
+    "settle.\n"
     "PRE-EMPT THE ROUND-TRIP: do NOT settle a pay-per-call order without a payment_token_id — the "
-    "platform hard-gate REJECTS a token-less, non-explicit-EVO pay-per-call settle (HTTP 400 "
+    "platform hard-gate REJECTS a token-less pay-per-call settle that does not explicitly opt in to "
+    "the bound-card direct charge (HTTP 400 "
     "INVALID_PAYMENT_METHOD), so calling this bare settle now just wastes a round-trip. Mint the "
     "token first, then settle WITH it. Orchestrate in THREE stages sharing ONE member_id across "
     "both sessions:\n"
@@ -519,9 +522,10 @@ _DEFAULT_TOKEN_ORCHESTRATION = (
     "method list. Either way then settle with the minted payment_token_id. Skipping the bind step "
     "(card already exists) does NOT mean skipping "
     "the mint — the payment stays identical to a fresh-card booking, only the bind step is omitted.\n"
-    "Only skip the token main path if the USER EXPLICITLY chose to charge their EVO card DIRECTLY "
-    "instead of via a network token — then settle on the EVO rail WITH evo_explicit=true (see the "
-    "explicit-EVO branch). Never fall back to a platform/developer/member default card."
+    "Only skip the token main path if the USER EXPLICITLY chose to charge their bound card DIRECTLY "
+    "instead of via a network token — then settle on the direct-charge rail WITH "
+    "direct_card_charge=true (see the explicit direct-card-charge branch). Never fall back to a "
+    "platform/developer/member default card."
 )
 
 
@@ -532,73 +536,75 @@ def _default_token_orchestration_advice(
     三段式主路径」的非阻塞编排建议，返回建议文案或 ``None``。
 
     触发条件（见 ``_needs_token_mint``）：本次是货币结算动作、未携带 payment_token_id（还没创建网络令牌）、
-    且未显式选 EVO（``evo_explicit`` 非真）。这**包含**「payload 带 payment_method_id（选了已绑卡）
-    但未显式选 EVO」的情形——已有卡默认也应先用该卡创建网络令牌，故此时仍给三段式主路径建议。仅当已带
-    payment_token_id（正走令牌直扣）或显式选了 EVO（``evo_explicit=true``）时返回 ``None``。"""
+    且未显式选直刷绑卡（``direct_card_charge`` 非真）。这**包含**「payload 带 payment_method_id（选了
+    已绑卡）但未显式选直刷绑卡」的情形——已有卡默认也应先用该卡创建网络令牌，故此时仍给三段式主路径
+    建议。仅当已带 payment_token_id（正走令牌直扣）或显式选了直刷绑卡（``direct_card_charge=true``）时
+    返回 ``None``。"""
     if not _needs_token_mint(session_id, component, action, payload):
         return None
     return _DEFAULT_TOKEN_ORCHESTRATION
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 方案 A 软引导：显式 EVO 分流不创建网络令牌（R14.2、R9.1）
+# 方案 A 软引导：显式直刷绑卡分流不创建网络令牌（R14.2、R9.1）
 # ─────────────────────────────────────────────────────────────────────────────
-# 与默认三段式主路径（未显式选卡 → 创建网络令牌直扣）相对：当客户端**显式提供** payment_method_id（EVO 卡）
-# 时，这是客户端明确选择 EVO 兜底轨结算的信号——此时编排应**明确**走 EVO 预授权+捕获、**不创建**
+# 与默认三段式主路径（未显式选卡 → 创建网络令牌直扣）相对：当客户端**显式提供** payment_method_id（绑卡）
+# 时，这是客户端明确选择直刷绑卡兜底轨结算的信号——此时编排应**明确**走预授权 + 捕获、**不创建**
 # Network_Token。这条分支在 11.1 里仅表现为「不给令牌建议」的沉默（`_settle_without_payment` 见到凭据
 # 即返回 False）；本处把它表述为一条清晰、可断言的显式引导，同时严格保持**软引导**语义：尊重客户端
 # 的显式选择，桥层不覆盖、不改卡、不把它改走令牌路径，也不硬拦截。
-_EXPLICIT_EVO_ORCHESTRATION = (
-    "EXPLICIT EVO SETTLEMENT (soft guidance): this pay-per-call settle step is an EXPLICIT EVO "
-    "direct charge — the payload carries evo_explicit=true, signalling the USER explicitly chose to "
-    "charge their EVO card DIRECTLY instead of minting a Network_Token. Honor that explicit choice — "
-    "settle via the EVO preauth+capture fallback rail and DO NOT mint a Network_Token: the default "
-    "token main path (create-order → mint → payment_token_id direct charge) is intentionally SKIPPED "
-    "here. This is SOFT guidance only: the bridge respects the explicit EVO selection as-is and does "
-    "NOT override, block, reroute to the token path, or fall back to any platform/developer/member "
-    "default card. NOTE — evo_explicit=true is required here so the platform hard-gate (Plan B) lets "
-    "this token-less EVO settle through; set it ONLY on a genuine explicit user EVO choice, never to "
-    "silence the gate on the default path (whose correct behavior is to mint and pay with "
-    "payment_token_id — including when a bound card already exists)."
+_EXPLICIT_DIRECT_CARD_CHARGE = (
+    "EXPLICIT DIRECT CARD CHARGE (soft guidance): this pay-per-call settle step is an EXPLICIT "
+    "direct charge on a bound card — the payload carries direct_card_charge=true, signalling the USER "
+    "explicitly chose to charge their bound card DIRECTLY instead of minting a Network_Token. Honor "
+    "that explicit choice — settle via the preauth+capture fallback rail and DO NOT mint a "
+    "Network_Token: the default token main path (create-order → mint → payment_token_id direct "
+    "charge) is intentionally SKIPPED here. This is SOFT guidance only: the bridge respects the "
+    "explicit selection as-is and does NOT override, block, reroute to the token path, or fall back "
+    "to any platform/developer/member default card. NOTE — direct_card_charge=true is required here "
+    "so the platform hard-gate (Plan B) lets this token-less settle through; set it ONLY on a "
+    "genuine explicit user choice, never to silence the gate on the default path (whose correct "
+    "behavior is to mint and pay with payment_token_id — including when a bound card already "
+    "exists)."
 )
 
 
-def _explicit_evo_no_mint(session_id: str, component: str, action: str, payload: dict[str, Any]) -> bool:
-    """方案 A 软引导（R14.2）：判断本次货币结算动作是否为**显式 EVO 直扣**（因而应明确走 EVO 兜底轨、
+def _explicit_direct_card_charge_no_mint(session_id: str, component: str, action: str, payload: dict[str, Any]) -> bool:
+    """方案 A 软引导（R14.2）：判断本次货币结算动作是否为**显式直刷绑卡**（因而应明确走直刷绑卡兜底轨、
     **不创建** Network_Token）。
 
     触发条件（两者同时满足）：①是货币结算动作（见 ``_is_settle_action``）；②payload 显式声明
-    ``evo_explicit=true``（用户明确选择直刷 EVO 卡，而非走网络令牌——见 ``_evo_explicit``）；且未携带
-    payment_token_id（后者是令牌直扣路径，不属于 EVO 分流）。**注意**：单有 payment_method_id（选了
-    已绑卡）但无 ``evo_explicit`` **不**触发本分支——那种情况归默认令牌主路径（用该卡创建网络令牌），由
-    ``_needs_token_mint`` 承接。据此把「显式 EVO → 走 EVO、不创建网络令牌」与默认令牌主路径以 ``evo_explicit``
-    为界互斥切分。"""
+    ``direct_card_charge=true``（用户明确选择直刷这张绑卡，而非走网络令牌——见
+    ``_direct_card_charge_requested``）；且未携带 payment_token_id（后者是令牌直扣路径，不属于直刷分流）。
+    **注意**：单有 payment_method_id（选了已绑卡）但无 ``direct_card_charge`` **不**触发本分支——那种情况
+    归默认令牌主路径（用该卡创建网络令牌），由 ``_needs_token_mint`` 承接。据此把「显式直刷 → 走直刷绑卡、
+    不创建网络令牌」与默认令牌主路径以 ``direct_card_charge`` 为界互斥切分。"""
     if not _is_settle_action(session_id, component, action):
         return False
     p = payload or {}
     has_token = bool(str(p.get("payment_token_id") or "").strip())
-    return _evo_explicit(p) and not has_token
+    return _direct_card_charge_requested(p) and not has_token
 
 
-def _explicit_evo_orchestration_advice(
+def _explicit_direct_card_charge_advice(
     session_id: str, component: str, action: str, payload: dict[str, Any]
 ) -> str | None:
-    """方案 A 软引导（R14.2）：显式 EVO 分流时返回「走 EVO 兜底轨、不创建网络令牌」的非阻塞引导文案，
-    否则返回 ``None``。"""
-    if not _explicit_evo_no_mint(session_id, component, action, payload):
+    """方案 A 软引导（R14.2）：显式直刷绑卡分流时返回「走直刷绑卡兜底轨、不创建网络令牌」的非阻塞引导
+    文案，否则返回 ``None``。"""
+    if not _explicit_direct_card_charge_no_mint(session_id, component, action, payload):
         return None
-    return _EXPLICIT_EVO_ORCHESTRATION
+    return _EXPLICIT_DIRECT_CARD_CHARGE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 方案 A 软引导：令牌主路径失败回退不静默改卡（R14.3、R9.2）
 # ─────────────────────────────────────────────────────────────────────────────
-# 与默认三段式主路径（11.1）/ 显式 EVO 分流（11.2）互补，本段处理**失败**场景：令牌现结主路径的
+# 与默认三段式主路径（11.1）/ 显式直刷绑卡分流（11.2）互补，本段处理**失败**场景：令牌现结主路径的
 # 三个环节——① 锁单（create-order）、② 创建 Network_Token（start_token_creation 相关子流程）、
 # ③ 以 payment_token_id 直扣——任一环节返回失败/错误态时，桥层附一条**非阻塞**引导，说明失败发生在
-# 主路径的哪一环，并提示「可回退到 EVO 兜底轨，但须由客户端显式决定；绝不静默改用 platform/developer/
-# member 默认卡结算」。仍是软引导：桥层不硬拦截、不自动改卡、不替客户端决定是否回退 EVO——是否回退
-# EVO 交由客户端显式决定。
+# 主路径的哪一环，并提示「可回退到直刷绑卡兜底轨，但须由客户端显式决定；绝不静默改用 platform/developer/
+# member 默认卡结算」。仍是软引导：桥层不硬拦截、不自动改卡、不替客户端决定是否回退——是否回退
+# 交由客户端显式决定。
 
 # A2A 任务的终态失败状态（task.status.state，大小写无关比较）。只有这两个视为「失败」，其余
 # （completed / input-required / working / canceled 等）不触发失败回退引导。取值口径与领域无关，
@@ -629,12 +635,12 @@ _TOKEN_PATH_FAILURE_STAGES = {
 _TOKEN_PATH_FAILURE_ADVICE = (
     "TOKEN MAIN-PATH FAILURE (soft guidance): the default INDEPENDENT Network_Token settle path "
     "FAILED at {stage}. The main path is create-order (lock) → mint Network_Token → payment_token_id "
-    "direct charge; this failure is in that path (NOT an explicit EVO settlement). You MAY fall back "
-    "to the EVO preauth+capture fallback rail, but that fallback is the CLIENT's EXPLICIT decision: "
-    "surface this failure to the USER and only settle via EVO if the user explicitly chooses it (then "
-    "resend the settle action carrying the user-chosen EVO payment_method_id). Do NOT silently retry, "
-    "and — above all — NEVER silently fall back to any platform / developer / member DEFAULT card to "
-    "settle this order."
+    "direct charge; this failure is in that path (NOT an explicit bound-card direct charge). You MAY "
+    "fall back to the preauth+capture fallback rail, but that fallback is the CLIENT's EXPLICIT "
+    "decision: surface this failure to the USER and only settle that way if the user explicitly "
+    "chooses it (then resend the settle action carrying the user-chosen payment_method_id). Do NOT "
+    "silently retry, and — above all — NEVER silently fall back to any platform / developer / "
+    "member DEFAULT card to settle this order."
 )
 
 
@@ -642,15 +648,15 @@ def _token_path_stage(
     session_id: str, component: str, action: str, payload: dict[str, Any]
 ) -> str | None:
     """把一次交互定位到令牌现结主路径的哪一环，返回 ``"lock"`` / ``"mint"`` / ``"charge"``；若本次
-    交互不属于令牌主路径（例如显式 EVO 结算、或与资金无关的普通卡片动作）则返回 ``None``。
+    交互不属于令牌主路径（例如显式直刷绑卡结算、或与资金无关的普通卡片动作）则返回 ``None``。
 
     判定顺序（互斥）：
       ① 独立 Payment_Session（``kind == "payment"``，由 start_token_creation / start_payment 开启）
          内的任何交互 → ``"mint"``（创建网络令牌 / 支付凭据准备子流程，含其 passkey/poll 环节）。
       ② Booking_Session 内 payload 显式携带 ``payment_token_id`` → ``"charge"``（令牌直扣）。
-      ③ Booking_Session 内**显式声明 evo_explicit=true（显式 EVO 直扣）** → 非令牌主路径，返回
-         ``None``（EVO 结算失败属 R9.5，不在本令牌回退引导范围）。注意：仅带 payment_method_id 但无
-         evo_explicit（选了已绑卡、默认应先创建网络令牌）**不**属此列，仍按 ④ 归为 ``"lock"``。
+      ③ Booking_Session 内**显式声明 direct_card_charge=true（显式直刷绑卡）** → 非令牌主路径，返回
+         ``None``（直刷绑卡结算失败属 R9.5，不在本令牌回退引导范围）。注意：仅带 payment_method_id 但无
+         direct_card_charge（选了已绑卡、默认应先创建网络令牌）**不**属此列，仍按 ④ 归为 ``"lock"``。
       ④ Booking_Session 内的货币结算动作（见 ``_is_settle_action``）且未带任何显式凭据 → ``"lock"``
          （默认主路径的锁单 / 结算环节）。"""
     kind = (_sessions.get(session_id, {}) or {}).get("kind")
@@ -659,7 +665,7 @@ def _token_path_stage(
     p = payload or {}
     if str(p.get("payment_token_id") or "").strip():
         return "charge"
-    if _explicit_evo_no_mint(session_id, component, action, p):
+    if _explicit_direct_card_charge_no_mint(session_id, component, action, p):
         return None
     if _is_settle_action(session_id, component, action):
         return "lock"
@@ -670,7 +676,7 @@ def _token_path_failure_advice(
     session_id: str, component: str, action: str, payload: dict[str, Any], out: dict[str, Any]
 ) -> str | None:
     """方案 A 软引导（R14.3）：当本次交互属于令牌现结主路径且结果为失败态时，返回定位到具体环节的
-    「失败 + 可显式回退 EVO、绝不静默改用默认卡」引导文案；否则返回 ``None``。"""
+    「失败 + 可显式回退到直刷绑卡、绝不静默改用默认卡」引导文案；否则返回 ``None``。"""
     if not _is_failure_result(out):
         return None
     stage = _token_path_stage(session_id, component, action, payload)
@@ -683,7 +689,7 @@ def _attach_token_path_failure(
     out: dict[str, Any], session_id: str, component: str, action: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
     """若本次交互命中令牌主路径失败回退场景（R14.3），把引导挂到 ``out["token_path_failure"]`` 后
-    原样返回。非阻塞：不改动其余字段、不改写卡片、不替客户端决定是否回退 EVO。"""
+    原样返回。非阻塞：不改动其余字段、不改写卡片、不替客户端决定是否回退到直刷绑卡。"""
     advice = _token_path_failure_advice(session_id, component, action, payload, out)
     if advice:
         out["token_path_failure"] = advice
@@ -696,7 +702,7 @@ def _attach_token_path_failure(
 # 为什么必须结构化：订单卡只暴露 ONE 个 `pay` 动作（``carries: ["order_id"]``，连凭证字段都没
 # 有），所以「有哪几条轨可选」在协议里**完全没有载体** —— agent 只能从 guide 的两百多行散文里
 # 自己推。2026-11-11 实测两轮：把三条轨写进 guide（含优先序与歧义消解）后，agent 仍只向用户列出
-# 两条（network token / EVO 3DS），漏掉中间那条静默网关令牌轨。散文控制不住一个 LLM 的选项列表，
+# 两条（network token / 绑卡 3DS），漏掉中间那条静默网关令牌轨。散文控制不住一个 LLM 的选项列表，
 # 而这份 dict 直接出现在工具返回值里、紧贴着那张卡，agent 必读。
 _SETTLEMENT_RAIL_ACTION_IDS = frozenset({"pay", "checkout"})
 
@@ -735,11 +741,11 @@ _SETTLEMENT_RAILS_HINT: dict[str, Any] = {
         },
         {
             "n": 3,
-            "rail": "evo_3ds",
-            "label": "EVO card with 3DS web authorization",
+            "rail": "card_3ds",
+            "label": "Bound card with 3DS web authorization",
             "browser_page": True,
             "how": (
-                "settle this action carrying payment_method_id + evo_explicit=true → the settle "
+                "settle this action carrying payment_method_id + direct_card_charge=true → the settle "
                 "returns AUTHENTICATION_REQUIRED, open the 3DS page, then resume"
             ),
             "take_when": (
@@ -1060,7 +1066,7 @@ async def act(session_id: str, component: str, action: str, payload: dict[str, A
     it with the user first.
 
     To attach a payment result, include ``payment_token_id`` (UnionPay) or ``payment_method_id``
-    (EVO/Visa/Mastercard) in the payload of the action that SETTLES money (see ``start_payment``).
+    (Visa / Mastercard) in the payload of the action that SETTLES money (see ``start_payment``).
     DO NOT GUESS WHICH ACTION THAT IS — read the action's ``carries``: the settling action is the one
     whose ``carries`` lists ``payment_token_id`` / ``payment_method_id``. HOTEL, RIDE and FLIGHT are
     all lock-then-pay: their order ``confirm`` only LOCKS the room / fare and moves NO money (it does
@@ -1109,22 +1115,23 @@ async def act(session_id: str, component: str, action: str, payload: dict[str, A
     # 非阻塞软引导（三分支互斥，失败态优先）：动作本身始终照常转发给编排器（硬拦截属于编排器/商户
     # 后端，不在这层薄桥里做）。
     #   ⓪ 令牌主路径失败回退（R14.3）：锁单 / 创建网络令牌 / payment_token_id 直扣任一环节失败（传输错误或
-    #      failed/rejected 终态）→ 附 token_path_failure 引导（指示失败环节 + 可显式回退 EVO + 绝不
+    #      failed/rejected 终态）→ 附 token_path_failure 引导（指示失败环节 + 可显式回退到直刷绑卡 + 绝不
     #      静默改用默认卡）；失败优先，不再叠加下面的成功态软引导。
-    #   ① 显式 EVO 分流（R14.2）：payload 显式声明 evo_explicit=true（用户明确选择直刷 EVO 卡而非
-    #      网络令牌）→ 明确走 EVO 兜底轨、不创建网络令牌；软引导，尊重客户端显式选择，不覆盖、不改走令牌路径。
-    #   ② 默认三段式主路径（R14.1）：现结且未携 payment_token_id、且未显式选 EVO（evo_explicit 非真）
+    #   ① 显式直刷绑卡分流（R14.2）：payload 显式声明 direct_card_charge=true（用户明确选择直刷这张绑卡
+    #      而非网络令牌）→ 明确走直刷绑卡兜底轨、不创建网络令牌；软引导，尊重客户端显式选择，不覆盖、
+    #      不改走令牌路径。
+    #   ② 默认三段式主路径（R14.1）：现结且未携 payment_token_id、且未显式选直刷绑卡（direct_card_charge 非真）
     #      → 默认走独立 Network_Token 现结（锁单 → 独立会话创建网络令牌 → 回会话以 payment_token_id 直扣）。
-    #      **含**「payload 带 payment_method_id（选了已绑卡）但未显式选 EVO」的情形——已有卡默认也应
+    #      **含**「payload 带 payment_method_id（选了已绑卡）但未显式选直刷绑卡」的情形——已有卡默认也应
     #      先用该卡创建网络令牌。仅当真的无任何凭据时才附「未选卡」默认卡警告（有 payment_method_id 时不附）。
     fail_advice = _token_path_failure_advice(session_id, component, action, payload, out)
     if fail_advice:
         out["token_path_failure"] = fail_advice
         return out
     if "error" not in out:
-        evo_advice = _explicit_evo_orchestration_advice(session_id, component, action, payload)
-        if evo_advice:
-            out["evo_orchestration"] = evo_advice
+        direct_charge_advice = _explicit_direct_card_charge_advice(session_id, component, action, payload)
+        if direct_charge_advice:
+            out["direct_card_charge_orchestration"] = direct_charge_advice
         else:
             advice = _default_token_orchestration_advice(session_id, component, action, payload)
             if advice:
@@ -1155,19 +1162,21 @@ async def poll(session_id: str, component: str) -> dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 # 之前 _default_token_orchestration_advice 只在「裸结算（未带任何凭据）」时才触发，而 agent 往往
 # 一开始就按老指引走 start_payment 选卡、拿回 payment_method_id，令牌建议永远来不及出现。这里在
-# start_payment 的返回上恒附一条非阻塞提醒：说明它是显式/回退 EVO 轨，pay-per-call 默认应走
+# start_payment 的返回上恒附一条非阻塞提醒：说明它是显式/回退的直刷绑卡轨，pay-per-call 默认应走
 # start_token_creation 创建网络令牌直扣——把令牌主路径的引导**提前**到 agent 刚进入选卡这一刻。
 _START_PAYMENT_TOKEN_REMINDER = (
-    "REMINDER (soft guidance): start_payment is the EXPLICIT / FALLBACK EVO rail, NOT the pay-per-call "
-    "default. If the user has NOT explicitly chosen an EVO card for a pay-per-call order, the DEFAULT "
+    "REMINDER (soft guidance): start_payment is the EXPLICIT / FALLBACK direct-card-charge rail, NOT "
+    "the pay-per-call default. If the user has NOT explicitly chosen to charge a bound card directly "
+    "for a pay-per-call order, the DEFAULT "
     "main path is an INDEPENDENT Network_Token direct charge via start_token_creation: create-order "
     "(lock the order_id + authoritative amount) → start_token_creation(amount_cents=<that amount>, "
     "order_id=<that order_id>, member_id=<same member>; add payment_method_id=<the card the user "
     "named> to mint from that card and SKIP the picker) → settle the money-action with the minted "
     "payment_token_id (NOT payment_method_id). Only continue on THIS rail if the user explicitly picked "
-    "an EVO card, or you are falling back after a token-path failure with the user's consent — and "
-    "NEVER fall back to any platform / developer / member default card. If you DO settle via the EVO "
-    "rail on the user's explicit choice, the pay-per-call settle payload MUST carry evo_explicit=true "
+    "a bound card to charge directly, or you are falling back after a token-path failure with the "
+    "user's consent — and NEVER fall back to any platform / developer / member default card. If you "
+    "DO settle on the direct-charge rail on the user's explicit choice, the pay-per-call settle "
+    "payload MUST carry direct_card_charge=true "
     "(the server-side hard-gate rejects a token-less pay-per-call settle without it)."
 )
 
@@ -1180,8 +1189,8 @@ async def start_payment(
     member_id: str = "",
     payment_method_id: str = "",
 ) -> dict[str, Any]:
-    """MERCHANT-ORDER PRE-PAYMENT — EXPLICIT / FALLBACK EVO RAIL ONLY (not the pay-per-call default).
-    Use this to pick a payment credential to attach to a booking ``confirm`` (hotel/flight/ride): it
+    """MERCHANT-ORDER PRE-PAYMENT — EXPLICIT / FALLBACK DIRECT-CARD-CHARGE RAIL ONLY (not the
+    pay-per-call default). Use this to pick a payment credential to attach to a booking ``confirm`` (hotel/flight/ride): it
     drives the payment ``pay-setup`` scenario and by itself NEVER charges the card (no charge, no
     ``charge_no``).
 
@@ -1194,12 +1203,13 @@ async def start_payment(
     and only surfaces ACTIVE (usable) cards, so it can NEVER show disabled / pending ones — never
     invent an amount (e.g. 100) or a ``recipient_name`` (e.g. "Card Holder") just to see the cards.
 
-    NOT THE DEFAULT MAIN PATH. For a pay-per-call order where the user has NOT explicitly chosen an
-    EVO card, the DEFAULT is an INDEPENDENT Network_Token direct charge via ``start_token_creation``
-    (create-order to lock the order_id + authoritative amount → mint a Network_Token bound to that
+    NOT THE DEFAULT MAIN PATH. For a pay-per-call order where the user has NOT explicitly chosen to
+    charge a bound card directly, the DEFAULT is an INDEPENDENT Network_Token direct charge via
+    ``start_token_creation`` (create-order to lock the order_id + authoritative amount → mint a
+    Network_Token bound to that
     order_id → settle with ``payment_token_id``). Call ``start_payment`` ONLY when the user
-    EXPLICITLY picks an EVO card, or as a FALLBACK after a token-path stage fails and the user opts
-    to fall back. See ``guide()`` for the full precedence.
+    EXPLICITLY picks a bound card to charge directly, or as a FALLBACK after a token-path stage
+    fails and the user opts to fall back. See ``guide()`` for the full precedence.
 
     For a STANDALONE payment (charge a
     card directly and get a refundable ``charge_no``) or a REFUND, do NOT call this — start those
@@ -1207,19 +1217,19 @@ async def start_payment(
     phone +1..." or "refund charge chg_..."), then drive the returned cards with ``act(...)``.
     To CREATE A STANDALONE NETWORK TOKEN (mint-only, no charge) do NOT call this either — that is
     the ``create-token`` scenario via book("create a network token …"), and it mints on ALL THREE
-    rails (UnionPay / Visa / EVO). The "only a UnionPay card mints a network-token; EVO/Visa handed
+    rails (UnionPay / Visa / Mastercard). The "only a UnionPay card mints a network-token; Visa / Mastercard handed
     back as ``payment_method_id``" behavior described below is specific to THIS merchant pre-payment
     path.
 
     Start a SEPARATE payment session (independent context) to pick/verify a payment method BEFORE
-    confirming an order. This is BRAND-AGNOSTIC across the cards it surfaces (UnionPay AND EVO
-    Visa/Mastercard); each row carries an ``id`` and a ``payment_brand``. It does NOT force UnionPay.
+    confirming an order. This is BRAND-AGNOSTIC across the cards it surfaces (UnionPay AND
+    Visa / Mastercard); each row carries an ``id`` and a ``payment_brand``. It does NOT force UnionPay.
     The picker is for CHOOSING a usable card to pay with — it lists only ACTIVE cards, NOT a full or
     read-only inventory; to just browse / view cards (including disabled) use ``book("list my cards …")``.
 
     USER-DRIVEN (explicit/fallback only). Do NOT call this as the default pre-step for every settle —
-    that is ``start_token_creation`` (see above). When this EVO rail IS used, never confirm without a
-    user-chosen payment method, and never rely on a platform/member "default"
+    that is ``start_token_creation`` (see above). When this direct-charge rail IS used, never confirm
+    without a user-chosen payment method, and never rely on a platform/member "default"
     card. Present the returned methods to the user (brand + last4) and let the USER choose which one
     to use; do NOT auto-select, not even when exactly one card is listed (confirm that one with the
     user first). If the picker is EMPTY, ask the user to add a card and ask which brand they want
@@ -1230,7 +1240,7 @@ async def start_payment(
       - Pick a listed method with its row action (it ``carries`` the ``id`` + ``payment_brand``).
         The routing follows the CHOSEN card's ``payment_brand``: a UnionPay card mints a
         network-token via a passkey (open_url → poll to ACTIVE) yielding ``payment_token_id``;
-        **any other brand** (``evo`` for Mastercard-and-friends, ``visa`` for a VTS-bound Visa) is
+        **any other brand** (``mastercard`` for Mastercard-and-friends, ``visa`` for a VTS-bound Visa) is
         returned directly as ``payment_method_id`` (no passkey) for the host order to settle
         server-side. Attach whichever the confirm action ``carries`` names.
       - If selecting a method returns a card with an ``open_url`` action (passkey / enrollment /
@@ -1249,12 +1259,12 @@ async def start_payment(
             **unified card-entry page**. Submit ``{}`` and open the returned
             ``link_url``: the cardholder types the card there and **the page itself routes by the
             card's BIN** — Visa (4…) runs the native VTS + Payment Passkey rail, any other brand
-            (Mastercard, …) runs EVO. So you do NOT need to know the brand up front, and there is
+            (Mastercard, …) runs the acquiring-gateway rail. So you do NOT need to know the brand up front, and there is
             nothing to pass for "Visa" vs "Mastercard".
         ⚠️ Omitting ``brand`` does **NOT** default to UnionPay — it goes to the unified card page.
-        To bind a UnionPay card you MUST pass ``brand:"unionpay"`` explicitly. (Legacy note: the old
-        ``brand:"evo"`` value still lands on the unified card page, since the gate is simply
-        "is it unionpay or not", but it is obsolete — don't emit it.)
+        To bind a UnionPay card you MUST pass ``brand:"unionpay"`` explicitly. (Legacy note: any
+        non-``unionpay`` value still lands on the unified card page, since the gate is simply
+        "is it unionpay or not" — do not emit a card-brand name here.)
 
     Drive this session with STRUCTURED ``act(...)`` calls ONLY — do not send natural-language
     ``send_message`` here (free text in a payment sub-flow gets misrouted). Reuse THIS session for
@@ -1266,14 +1276,14 @@ async def start_payment(
     already named the exact card to use, you MAY instead pass its ``payment_method_id`` to this tool:
     the orchestrator resolves the card's ``payment_brand`` from that id and SKIPS the
     ``payment.method-list`` picker, routing straight on the card's rail (UnionPay mints the
-    network-token; EVO/Visa is handed back as the ``payment_method_id``) — in that case do NOT also
+    network-token; Visa / Mastercard is handed back as the ``payment_method_id``) — in that case do NOT also
     send a ``select-method``. Pass it ONLY for a card the user explicitly chose; leave it empty to let
     the user pick (never a platform/member default). (Earlier builds required omitting it because the
     picker was gated on the brand and a lone ``payment_method_id`` left ``payment_brand`` uncaptured;
     the orchestrator now resolves the brand from the id, so a user-chosen id is safe to forward.)
 
     ``amount_cents`` = order total × 100. ``recipient_account`` (phone or email) is only needed for
-    the UnionPay network-token branch; leave it empty for EVO. ``member_id`` (optional) must match
+    the UnionPay network-token branch; leave it empty for a Visa / Mastercard card. ``member_id`` (optional) must match
     the booking's member. ``payment_method_id`` (optional) — the id of the card the USER explicitly
     chose; forwarding it skips the picker (brand auto-resolved by the orchestrator). Leave empty to
     show the picker; never pass a platform/member default."""
@@ -1303,8 +1313,8 @@ async def start_payment(
         }
         # When the USER has explicitly named the card, forward its payment_method_id: the
         # orchestrator resolves payment_brand from the id and SKIPS the payment.method-list picker,
-        # routing straight on the card's rail (UnionPay mints a network-token; EVO/Visa hands the id
-        # back). In that case do NOT also drive a select-method. Set it ONLY for a user-chosen card —
+        # routing straight on the card's rail (UnionPay mints a network-token; Visa / Mastercard hands
+        # the id back). In that case do NOT also drive a select-method. Set it ONLY for a user-chosen card —
         # never a platform/member default; empty => the picker is shown and the user selects.
         if payment_method_id:
             setup_payload["payment_method_id"] = payment_method_id
@@ -1317,7 +1327,7 @@ async def start_payment(
     except AuthError as exc:
         return {"session_id": sid, "error": f"auth failed: {exc}", "cards": [], "text": ""}
     out = _result(sid, status, raw)
-    # 方案 A 软引导（提前触发）：进入 start_payment 选卡即提醒「令牌主路径优先、EVO 仅显式/回退」，
+    # 方案 A 软引导（提前触发）：进入 start_payment 选卡即提醒「令牌主路径优先、直刷绑卡仅显式/回退」，
     # 不阻塞流程、不改卡。
     if "error" not in out:
         out["token_path_reminder"] = _START_PAYMENT_TOKEN_REMINDER
@@ -1358,20 +1368,22 @@ async def start_token_creation(
     already-bound cards (``payment.method-list``) so you pick an EXISTING card to mint from — you do
     NOT need to re-bind. So for "pay with an existing card", the default is still: create-order →
     start_token_creation (pick that existing card, pass order_id) → pay with the minted
-    payment_token_id. Having a bound card is NEVER a reason to charge it directly via the EVO rail;
-    that EVO direct charge is only for an explicit user choice to skip the network token.
-    Minting works on ALL THREE rails by the CARD's brand: UnionPay (``open_url`` checkout passkey →
-    poll to ACTIVE), Visa (``open_url`` payment_url FIDO passkey → poll to ACTIVE), or EVO/Mastercard
+    payment_token_id. Having a bound card is NEVER a reason to charge it directly via the
+    direct-charge rail; that direct charge is only for an explicit user choice to skip the network
+    token. Minting works on ALL THREE rails by the CARD's brand: UnionPay (``open_url`` checkout passkey →
+    poll to ACTIVE), Visa (``open_url`` payment_url FIDO passkey → poll to ACTIVE), or Mastercard
     (SYNCHRONOUS — no browser step).
 
-    ``token_credential`` (optional, EVO/Mastercard cards ONLY — ignored for UnionPay/Visa) picks WHICH
-    CREDENTIAL the minted token carries, and that choice decides whether the LATER charge is silent:
+    ``token_credential`` (optional) picks WHICH CREDENTIAL the minted token carries, and that choice
+    decides whether the LATER charge is silent. Not applicable to UnionPay cards. A card that does not
+    support gateway tokens ignores this field and is minted in that card's own default way. When
+    omitted the platform picks by the card's actual capability, defaulting to ``network_token``.
       · omitted / ``"network_token"`` (DEFAULT, unchanged behaviour) — mints a cryptogram-bearing
         network token; the charge goes out as ``paymentMethod.type=networkToken``.
-      · ``"gateway_token"`` — mints NOTHING: the token carries the card's own EVO gateway (COF) token
+      · ``"gateway_token"`` — mints NOTHING: the token carries the card's own acquiring-gateway (COF) token
         and NO cryptogram, so the charge goes out as ``paymentMethod.type=token`` and settles in ONE
         call with **NO 3DS page and NO browser step**.
-    ``dynamic_data_type`` (optional, VISA cards ONLY — ignored for UnionPay/EVO) picks WHICH one-time
+    ``dynamic_data_type`` (optional, VISA cards ONLY — ignored for UnionPay / Mastercard) picks WHICH one-time
     data the Visa token carries; omitted = ``"TAVV"``. Choose it from what the user will DO with the token:
       · the user ALREADY said it is for ordering online / filling an external merchant's checkout page
         (e.g. "帮我生成一个网络令牌，用来网上下单") → pass ``"DAVV"`` and do NOT ask again. The result
@@ -1397,8 +1409,9 @@ async def start_token_creation(
     their choice. The form is fixed onto the token HERE, at mint time; every later charge of this token
     — INCLUDING a merchant order's ``pay`` (hotel / flight / ride) — reads it off the token document,
     so there is nothing to pass at charge time.
-    DO NOT CONFUSE THIS WITH THE EVO DIRECT RAIL: ``payment_method_id`` + ``evo_explicit=true`` on an
-    order's ``pay`` is EVO pre-auth, which ALWAYS raises a 3DS challenge. When the user asks for a
+    DO NOT CONFUSE THIS WITH THE DIRECT CARD CHARGE RAIL: ``payment_method_id`` +
+    ``direct_card_charge=true`` on an order's ``pay`` is a bound-card pre-auth, which ALWAYS raises a
+    3DS challenge. When the user asks for a
     'gateway token' / silent / no-browser / virtual-card payment they mean THIS argument, not that rail.
 
     WHY A SEPARATE SESSION: an A2A context owns a single ``flow_state`` (one active scenario, no
@@ -1416,7 +1429,7 @@ async def start_token_creation(
 
     ``amount_cents`` = the token's authoritative amount × 100 (integer, smallest currency unit).
     ``recipient_name`` / ``recipient_account`` are the PAYER's own name + phone/email, needed ONLY for
-    the UnionPay rail (leave empty for Visa/EVO; the flow re-collects them if a UnionPay card is
+    the UnionPay rail (leave empty for Visa / Mastercard; the flow re-collects them if a UnionPay card is
     picked). ``member_id`` (optional) MUST match the booking's member.
 
     ``payment_method_id`` (optional) — pass it ONLY when the USER has already named the exact card to
@@ -1491,7 +1504,7 @@ async def start_token_creation(
     cart clears through the platform's aggregate store and is NOT split by the sub-orders' acquiring
     providers — declaring a single provider (e.g. ``redaug``) is refused with ``PROVIDER_MISMATCH``.
     If each provider must clear into its own store, do not aggregate: lock, mint and pay the orders
-    one by one. EVO/Mastercard mints this aggregate token SYNCHRONOUSLY (no passkey). See
+    one by one. Mastercard mints this aggregate token SYNCHRONOUSLY (no passkey). See
     ``guide()``'s TRIP AGGREGATE PAYMENT section for the full mint→checkout→confirm→settle order."""
     bridge = _get_bridge()
     if member_id:
@@ -1511,7 +1524,7 @@ async def start_token_creation(
         # with structured actions.
         status, raw = await bridge.send_text(_ctx(sid), "Create a network token.")
         if status != 200:
-            # 创建网络令牌分类种子即传输失败 → 附「创建网络令牌环节失败、可显式回退 EVO」引导（R14.3）；本会话
+            # 创建网络令牌分类种子即传输失败 → 附「创建网络令牌环节失败、可显式回退到直刷绑卡」引导（R14.3）；本会话
             # 为独立 Payment_Session（kind="payment"），命中 mint 环节。
             return _attach_token_path_failure(
                 _result(sid, status, raw), sid, "payment.token-setup", "submit", {}
@@ -1545,7 +1558,7 @@ async def start_token_creation(
         # --provider-id（flag 出现即上送、空串原样转发）同口径。
         if provider_id is not None:
             submit_payload["provider_id"] = provider_id
-        # EVO 卡的凭证形态（见下方 docstring 的 ``token_credential``）。只在非空时上送：空 = 不声明，
+        # 绑卡的凭证形态（见下方 docstring 的 ``token_credential``）。只在非空时上送：空 = 不声明，
         # 由编排器落缺省 ``network_token``（既有行为一字不变）。与 provider_id 的 ``is not None``
         # 判据刻意不同——那个字段「声明了无效值」要 fail-closed，而这里空串没有独立语义，拼装时漏填
         # 不该变成一次被拒的建币。取值拼错时平台会显式 INVALID_REQUEST，不会静默回落。
@@ -1563,7 +1576,7 @@ async def start_token_creation(
         )
     except AuthError as exc:
         return {"session_id": sid, "error": f"auth failed: {exc}", "cards": [], "text": ""}
-    # 创建网络令牌提交若返回失败/错误态 → 附「创建网络令牌环节失败、可显式回退 EVO、绝不静默改用默认卡」引导
+    # 创建网络令牌提交若返回失败/错误态 → 附「创建网络令牌环节失败、可显式回退到直刷绑卡、绝不静默改用默认卡」引导
     # （R14.3）；成功则原样返回。
     return _attach_token_path_failure(
         _result(sid, status, raw), sid, "payment.token-setup", "submit", submit_payload
@@ -1576,7 +1589,7 @@ def open_url(url: str) -> dict[str, Any]:
     action has ``dispatch:"client"`` + ``capability:"open_url"``: UnionPay checkout (passkey),
     UnionPay card-enrollment (``enroll_url``), and the **unified card-entry page** (``link_url``,
     hosted by the platform) where the cardholder types any Visa/Mastercard and the page routes by
-    the card's BIN (Visa → VTS + Payment Passkey; other brands → EVO). The MCP server runs on the
+    the card's BIN (Visa → VTS + Payment Passkey; other brands → the acquiring-gateway rail). The MCP server runs on the
     user's machine, so this pops the page for the user to complete the passkey/enrollment/card
     entry. After they finish, drive the next card (e.g. "paid" then "poll", or "bound" then "poll").
 
@@ -1846,24 +1859,25 @@ PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (ow
     1. NETWORK TOKEN — the DEFAULT. Mint a cryptogram-bearing token from the card and settle in one
        call: no browser step, no 3DS page. Take it whenever the user states no preference.
     2. GATEWAY TOKEN, SILENT — mint with token_credential="gateway_token". The token carries the
-       card's own EVO gateway (COF) token and NO cryptogram, so the charge settles as
+       card's own acquiring-gateway (COF) token and NO cryptogram, so the charge settles as
        paymentMethod.type=token in ONE call with NO 3DS page and NO browser step. Take this
        whenever the user says 'gateway token' / silent / unattended / 'no browser page' / virtual
        card — and also when the card has NO network token at all (a frictionless binding yields
        none, so rail 1 would FAIL at the mint).
-    3. EVO CARD WITH 3DS — payment_method_id + evo_explicit=true (EVO pre-auth). ALWAYS raises a
-       3DS/FIDO page: the settle returns AUTHENTICATION_REQUIRED, you open the page, the user
-       completes it, then you resume. Offer it LAST, and take it only when the user explicitly wants
-       the cardholder-authenticated / web-authorized form.
+    3. BOUND CARD WITH 3DS — payment_method_id + direct_card_charge=true (a bound-card pre-auth).
+       ALWAYS raises a 3DS/FIDO page: the settle returns AUTHENTICATION_REQUIRED, you open the
+       page, the user completes it, then you resume. Offer it LAST, and take it only when the user
+       explicitly wants the cardholder-authenticated / web-authorized form.
   DISAMBIGUATING 'GATEWAY' — rails 2 and 3 are BOTH commonly called a 'gateway token' payment and
   both put the card's gateway token on the wire. When the user says only 'gateway' / 'gateway token'
   WITHOUT asking for authentication or a page, they mean RAIL 2 — the SILENT one. Choose rail 3 only
   on an explicit ask for 3DS / a web authorization / cardholder verification. If truly unsure, ask —
   but do NOT default to rail 3 just because the word 'gateway' appeared.
   • Booking + payment MUST share the same member_id.
-  • DEFAULT / CANONICAL MAIN PATH — you MUST take it UNLESS the user EXPLICITLY chose an EVO card.
-    For a pay-per-call order, settle via an INDEPENDENT NETWORK-TOKEN DIRECT CHARGE — a THREE-STAGE
-    flow orchestrated through start_token_creation (NOT start_payment), in EXACTLY this order
+  • DEFAULT / CANONICAL MAIN PATH — you MUST take it UNLESS the user EXPLICITLY chose to charge a
+    bound card directly. For a pay-per-call order, settle via an INDEPENDENT NETWORK-TOKEN DIRECT
+    CHARGE — a THREE-STAGE flow orchestrated through start_token_creation (NOT start_payment),
+    in EXACTLY this order
     (LOCK FIRST → MINT SECOND → CHARGE):
       1) LOCK FIRST — complete create-order to obtain the order_id (hotel hho_… / flight ffo_… /
          ride rio_…) AND its authoritative amount/currency BEFORE minting.
@@ -1908,21 +1922,23 @@ PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (ow
     mint from it (no re-binding). So "pay with an existing card" = create-order → start_token_creation
     (pick that card, bound to order_id) → pay with payment_token_id — identical to a fresh-card
     booking except you skip the bind step. Skipping the bind does NOT mean skipping the mint.
-  • EVO preauth+capture is NOT the default — it is the EXPLICIT / FALLBACK rail ONLY. Take it ONLY
-    when (a) the user EXPLICITLY chooses to charge their EVO card DIRECTLY instead of via a network
-    token (merely HAVING or picking a bound EVO card is NOT this — that still mints a token from the
-    card, see above), or (b) a stage of the token path above fails and the user explicitly opts to
-    fall back. To use it, run start_payment(...) (the method picker). NEVER settle by
-    silently falling back to any platform / developer / member default card, and NEVER auto-pick
-    EVO just because it is the only bound card — confirm with the user first.
+  • PREAUTH+CAPTURE ON A BOUND CARD is NOT the default — it is the EXPLICIT / FALLBACK rail ONLY.
+    Take it ONLY when (a) the user EXPLICITLY chooses to charge their bound card DIRECTLY instead of
+    via a network token (merely HAVING or picking a bound card is NOT this — that still mints a
+    token from the card, see above), or (b) a stage of the token path above fails and the user
+    explicitly opts to fall back. To use it, run start_payment(...) (the method picker). NEVER
+    settle by silently falling back to any platform / developer / member default card, and NEVER
+    auto-pick the direct charge just because that card is the only bound one — confirm with the user
+    first.
     HARD GATE (server-side): a pay-per-call settle that has NO payment_token_id is REJECTED with a
-    retriable=false guidance error UNLESS the pay payload carries evo_explicit=true. So when — and
-    ONLY when — the user explicitly chose the EVO rail, include evo_explicit=true in the settle
-    payload (alongside any payment_method_id). Never set evo_explicit=true to silence the gate on the
-    default path; the correct default is to mint a Network_Token and pay with payment_token_id.
-    NOT A SILENT RAIL: this EVO pre-auth ALWAYS requests cardholder authentication (a 3DS/FIDO page)
+    retriable=false guidance error UNLESS the pay payload carries direct_card_charge=true. So when — and
+    ONLY when — the user explicitly chose the direct-charge rail, include direct_card_charge=true in
+    the settle payload (alongside any payment_method_id). Never set direct_card_charge=true to
+    silence the gate on the default path; the correct default is to mint a Network_Token and pay
+    with payment_token_id.
+    NOT A SILENT RAIL: this pre-auth ALWAYS requests cardholder authentication (a 3DS/FIDO page)
     and the settle comes back AUTHENTICATION_REQUIRED — you then open the page, the user finishes it,
-    and you resume. So NEVER reach for evo_explicit=true to satisfy a request for a silent /
+    and you resume. So NEVER reach for direct_card_charge=true to satisfy a request for a silent /
     unattended / 'no browser page' / virtual-card payment: that one is the mint-time
     token_credential="gateway_token" above. The two are easy to mix up because BOTH are commonly
     called a 'gateway token' payment — the difference is that only the minted-token form is silent.
@@ -1944,21 +1960,24 @@ PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (ow
         does NOT mean UnionPay — pass `unionpay` explicitly for that. Never pick the rail for the user.
   • Routing follows the card the USER picked in the start_payment picker, by its payment_brand:
     a UnionPay card mints a token via a passkey (open_url → poll to ACTIVE) → payment_token_id;
-    any other brand (evo / visa) is returned directly as payment_method_id.
+    any other brand (mastercard / visa) is returned directly as payment_method_id.
   • STANDALONE TOKEN CREATION shares the same minting: the ``create-token`` scenario (start it with
     book("create a network token …")) mints a reusable network token on ALL THREE rails — UnionPay
-    (passkey), Visa (FIDO passkey), and EVO/Mastercard (synchronous, no browser); start_token_creation
+    (passkey), Visa (FIDO passkey), and Mastercard (synchronous, no browser); start_token_creation
     drives this same mint for the main path with an order_id bound. So do NOT tell the user network
     tokens are "UnionPay-only", and do NOT steer them to add a UnionPay card just to mint one — any
-    listed card (including an EVO Mastercard) can be minted. The "only UnionPay mints, EVO/Visa
+    listed card (including a Mastercard) can be minted. The "only UnionPay mints, Visa / Mastercard
     handed back" rule applies ONLY to paying an order via the start_payment picker.
-  • SILENT vs 3DS IS DECIDED AT MINT TIME — ``token_credential`` (EVO/Mastercard cards only).
+  • SILENT vs 3DS IS DECIDED AT MINT TIME — ``token_credential``. Not applicable to UnionPay cards. A
+    card that does not support gateway tokens ignores this field and is minted in that card's own
+    default way. When omitted the platform picks by the card's actual capability, defaulting to
+    ``network_token``.
     start_token_creation takes an optional ``token_credential`` choosing WHICH credential the minted
     token carries, and that fixes the on-wire rail for EVERY later charge of it (including a merchant
     order's pay):
       – omitted / "network_token" (DEFAULT, unchanged) — a cryptogram-bearing network token, charged
         as paymentMethod.type=networkToken;
-      – "gateway_token" — mints NOTHING: the token carries the card's own EVO gateway (COF) token and
+      – "gateway_token" — mints NOTHING: the token carries the card's own acquiring-gateway (COF) token and
         NO cryptogram, charged as paymentMethod.type=token, settling in ONE call with NO 3DS page and
         NO browser step.
     This is RAIL 2 of the three above. network_token stays the DEFAULT when the user states no
@@ -1967,8 +1986,8 @@ PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (ow
     (a frictionless binding yields none, so the default mint FAILS). Do NOT talk the user out of it
     and do NOT silently substitute rail 1 — "the network token is browser-less too" is NOT a reason
     to override a rail the user named. When the user asks for any of those words, THIS is
-    what they mean — it is a MINT-TIME argument here, NOT the evo_explicit rail below, and NOT the
-    standalone-only evo_route selector. Nothing extra is passed at charge time; the order's pay still
+    what they mean — it is a MINT-TIME argument here, NOT the direct_card_charge rail below, and NOT
+    the standalone-only card_route selector. Nothing extra is passed at charge time; the order's pay still
     just carries the minted payment_token_id.
   • AFTER binding a UnionPay card, MINT THE TOKEN BY PICKING THE CARD — do NOT shortcut. Reuse the
     SAME payment session: submit `payment.setup` with ONLY {amount_cents, recipient_name,
@@ -1988,8 +2007,9 @@ PAYMENT — INDEPENDENT NETWORK-TOKEN DIRECT CHARGE is the DEFAULT MAIN PATH (ow
     — their order `confirm` only LOCKS (no money, no credential accepted) and the charge is at `pay`
     on the resulting order card (hotel.order-detail#pay / ride.order-awaiting#pay /
     flight.order-detail#pay). The `carries` also names the field (payment_token_id for the token main
-    path; payment_method_id ONLY for the explicit/fallback EVO rail). Do NOT omit it to let the
-    platform charge a default — the settling action must always carry the credential resolved above.
+    path; payment_method_id ONLY for the explicit/fallback direct-charge rail). Do NOT omit it to let
+    the platform charge a default — the settling action must always carry the credential resolved
+    above.
 
 TRIP AGGREGATE PAYMENT — settle a whole cart of locked orders in ONE charge (trip checkout)
   When a session locked SEVERAL orders (e.g. a multi-room hotel trip, or a flight+hotel trip), the
@@ -1999,7 +2019,7 @@ TRIP AGGREGATE PAYMENT — settle a whole cart of locked orders in ONE charge (t
   the USER chooses, and the money-confirm card ALWAYS requires the user's explicit confirm — never
   auto-confirm.
   • NETWORK-TOKEN (the DEFAULT — same precedence as a single order: mint unless the user explicitly
-    chose to charge an EVO card directly). Bind ONE aggregate token to the whole GROUP:
+    chose to charge a bound card directly). Bind ONE aggregate token to the whole GROUP:
       1) From the cart-summary card read the payment-group id (pg_…) and the cart total + currency.
       2) In a SEPARATE payment session mint the aggregate token bound to the GROUP:
          start_token_creation(amount_cents=<cart TOTAL × 100 — the whole cart, not a single order>,
@@ -2009,7 +2029,7 @@ TRIP AGGREGATE PAYMENT — settle a whole cart of locked orders in ONE charge (t
          aggregate store and is NOT split by the sub-orders' acquiring providers — declaring a single
          provider (e.g. redaug) is refused with PROVIDER_MISMATCH. If each provider must clear into
          its own store, do not aggregate: lock, mint and pay the orders one by one.
-         Pick a bound card when the create-token picker lists them (Mastercard/EVO mints
+         Pick a bound card when the create-token picker lists them (Mastercard mints
          SYNCHRONOUSLY, no passkey; UnionPay/Visa use a passkey → poll to ACTIVE).
          This yields ONE payment_token_id
          whose frozen amount = the cart total and whose external_transaction_id = the payment-group id.
@@ -2019,10 +2039,10 @@ TRIP AGGREGATE PAYMENT — settle a whole cart of locked orders in ONE charge (t
       4) Surface the confirm card's total to the USER; only after they approve, send its confirm
          action carrying the same payment_token_id. That settles the whole cart in one charge against
          the group and polls to a terminal result card.
-  • EVO CARD (only when the user explicitly chose to charge a bound EVO card directly instead of a
-    network token). Send the cart-summary checkout action with NO token → a method picker lists the
+  • BOUND CARD, CHARGED DIRECTLY (only when the user explicitly chose that instead of a network
+    token). Send the cart-summary checkout action with NO token → a method picker lists the
     member's cards → the USER picks one → the confirm card's confirm carries payment_method_id +
-    evo_explicit=true → settles via one batch-level 3DS.
+    direct_card_charge=true → settles via one batch-level 3DS.
   • The trip session and the token-mint payment session MUST share the same member_id, else the token
     and the group belong to different users and the charge is refused. If a settle is refused for a
     token/order mismatch, the token wasn't bound to THIS pg_… — re-mint with order_id=<pg_…> and retry.
